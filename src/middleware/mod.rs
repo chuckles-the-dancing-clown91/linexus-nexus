@@ -1,2 +1,2 @@
-//! Tower Permission Funnel middleware.
-pub mod funnel;
+pub mod permission_funnel;
+pub mod rbac;
