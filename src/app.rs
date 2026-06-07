@@ -11,10 +11,73 @@ use loco_rs::{
     Result,
 };
 use migration::Migrator;
+use sea_orm::IntoActiveModel;
 use std::path::Path;
 
 #[allow(unused_imports)]
-use crate::{controllers, models::_entities::users, tasks, workers::downloader::DownloadWorker};
+use crate::{
+    controllers,
+    middleware::rbac,
+    models::{
+        _entities::users,
+        plans, roles as roles_model,
+        users::{Model as UserModel, RegisterParams},
+    },
+    tasks,
+    workers::downloader::DownloadWorker,
+};
+
+/// Default development admin credentials, seeded at boot in the development
+/// environment so the stack is usable end-to-end without manual setup.
+const DEV_ADMIN_EMAIL: &str = "admin@linexus.local";
+const DEV_ADMIN_PASSWORD: &str = "admin1234";
+const DEV_ADMIN_NAME: &str = "Linexus Admin";
+
+/// Seed the default RBAC roles and (in development) an admin user.
+///
+/// Idempotent: roles and the admin user are only created if absent, so this is
+/// safe to run on every boot.
+async fn seed_runtime(ctx: &AppContext) -> Result<()> {
+    // Always ensure the default system roles exist.
+    roles_model::Model::seed_defaults(&ctx.db).await?;
+
+    // Only seed a default admin user in development.
+    if !matches!(ctx.environment, Environment::Development) {
+        return Ok(());
+    }
+
+    if UserModel::find_by_email(&ctx.db, DEV_ADMIN_EMAIL)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let admin = UserModel::create_with_password(
+        &ctx.db,
+        &RegisterParams {
+            email: DEV_ADMIN_EMAIL.to_string(),
+            password: DEV_ADMIN_PASSWORD.to_string(),
+            name: DEV_ADMIN_NAME.to_string(),
+        },
+    )
+    .await?;
+
+    // Mark verified, put on the enterprise plan, and grant the admin role.
+    let admin = admin.into_active_model().verified(&ctx.db).await?;
+    let admin = admin
+        .into_active_model()
+        .set_plan(&ctx.db, "enterprise")
+        .await?;
+    rbac::assign_role(&ctx.db, admin.id, plans::default_role("enterprise")).await?;
+
+    tracing::info!(
+        email = DEV_ADMIN_EMAIL,
+        "seeded development admin user (plan=enterprise, role=admin)"
+    );
+
+    Ok(())
+}
 
 pub struct App;
 #[async_trait]
@@ -41,6 +104,15 @@ impl Hooks for App {
         create_app::<Self, Migrator>(mode, environment, config).await
     }
 
+    /// Runs after the database has migrated and before the server/worker start.
+    /// This is the hook the CLI `start` path actually invokes (it calls
+    /// `create_app` directly, bypassing `boot`), so seeding lives here to
+    /// guarantee it runs. Seeds default roles + a dev admin so auth and
+    /// permissions work out of the box.
+    async fn before_run(ctx: &AppContext) -> Result<()> {
+        seed_runtime(ctx).await
+    }
+
     async fn initializers(_ctx: &AppContext) -> Result<Vec<Box<dyn Initializer>>> {
         Ok(vec![])
     }
@@ -51,6 +123,7 @@ impl Hooks for App {
             .add_route(controllers::tasks::routes())
             .add_route(controllers::agents::routes())
             .add_route(controllers::roles::routes())
+            .add_route(controllers::subscription::routes())
     }
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
         queue.register(DownloadWorker::build(ctx)).await?;

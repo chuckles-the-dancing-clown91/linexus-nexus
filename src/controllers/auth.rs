@@ -1,7 +1,9 @@
 use crate::{
     mailers::auth::AuthMailer,
+    middleware::rbac,
     models::{
         _entities::users,
+        plans,
         users::{LoginParams, RegisterParams},
     },
     views::auth::{CurrentResponse, LoginResponse},
@@ -65,6 +67,18 @@ async fn register(
         .into_active_model()
         .set_email_verification_sent(&ctx.db)
         .await?;
+
+    // Assign the baseline role for the user's plan (defaults to `free` → `viewer`).
+    // Best-effort: a missing role (e.g. roles not yet seeded) must not fail sign-up.
+    let default_role = plans::default_role(&user.plan);
+    if let Err(err) = rbac::assign_role(&ctx.db, user.id, default_role).await {
+        tracing::warn!(
+            user_pid = user.pid.to_string(),
+            role = default_role,
+            error = err.to_string(),
+            "could not assign default role on registration",
+        );
+    }
 
     AuthMailer::send_welcome(&ctx, &user).await?;
 
@@ -155,13 +169,18 @@ async fn login(State(ctx): State<AppContext>, Json(params): Json<LoginParams>) -
         .generate_jwt(&jwt_secret.secret, jwt_secret.expiration)
         .or_else(|_| unauthorized("unauthorized!"))?;
 
-    format::json(LoginResponse::new(&user, &token))
+    let roles = rbac::get_user_roles(&ctx.db, user.id).await?;
+    let permissions = rbac::get_effective_permissions(&ctx.db, user.id).await?;
+
+    format::json(LoginResponse::new(&user, &token, roles, permissions))
 }
 
 #[debug_handler]
 async fn current(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
-    format::json(CurrentResponse::new(&user))
+    let roles = rbac::get_user_roles(&ctx.db, user.id).await?;
+    let permissions = rbac::get_effective_permissions(&ctx.db, user.id).await?;
+    format::json(CurrentResponse::new(&user, roles, permissions))
 }
 
 /// Magic link authentication provides a secure and passwordless way to log in to the application.
@@ -223,7 +242,10 @@ async fn magic_link_verify(
         .generate_jwt(&jwt_secret.secret, jwt_secret.expiration)
         .or_else(|_| unauthorized("unauthorized!"))?;
 
-    format::json(LoginResponse::new(&user, &token))
+    let roles = rbac::get_user_roles(&ctx.db, user.id).await?;
+    let permissions = rbac::get_effective_permissions(&ctx.db, user.id).await?;
+
+    format::json(LoginResponse::new(&user, &token, roles, permissions))
 }
 
 #[debug_handler]

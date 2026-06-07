@@ -366,4 +366,13 @@ impl ActiveModel {
         self.magic_link_expiration = ActiveValue::set(None);
         self.update(db).await.map_err(ModelError::from)
     }
+
+    /// Sets the user's subscription plan tier and persists it.
+    ///
+    /// # Errors
+    /// - Returns an error if database update fails
+    pub async fn set_plan(mut self, db: &DatabaseConnection, plan: &str) -> ModelResult<Model> {
+        self.plan = ActiveValue::set(plan.to_string());
+        self.update(db).await.map_err(ModelError::from)
+    }
 }

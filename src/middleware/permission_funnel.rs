@@ -55,7 +55,13 @@ impl OperationIntent {
 
     fn detect_destructive(permission: &str) -> bool {
         let destructive_actions = [
-            "delete", "remove", "destroy", "format", "partition", "wipe", "cancel",
+            "delete",
+            "remove",
+            "destroy",
+            "format",
+            "partition",
+            "wipe",
+            "cancel",
         ];
         let perm_lower = permission.to_lowercase();
         destructive_actions

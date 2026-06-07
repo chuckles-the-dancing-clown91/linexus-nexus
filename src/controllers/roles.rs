@@ -34,7 +34,7 @@ impl From<roles::Model> for RoleResponse {
         Self {
             id: role.id,
             name: role.name.clone(),
-            description: role.description,
+            description: role.description.clone(),
             permissions: role.get_permissions(),
             is_system: role.is_system,
         }
@@ -48,10 +48,7 @@ pub struct UserRolesResponse {
 }
 
 /// List all roles
-pub async fn list(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn list(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "roles:read").await?;
 
@@ -89,8 +86,7 @@ pub async fn assign(
     rbac::require_permission(&ctx.db, user.id, "roles:assign").await?;
 
     // Find the target user
-    let target_user =
-        crate::models::users::Model::find_by_email(&ctx.db, &req.user_email).await?;
+    let target_user = crate::models::users::Model::find_by_email(&ctx.db, &req.user_email).await?;
 
     // Assign the role
     rbac::assign_role(&ctx.db, target_user.id, &req.role_name).await?;
@@ -105,10 +101,7 @@ pub async fn assign(
 }
 
 /// Get roles for the current user
-pub async fn my_roles(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn my_roles(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     let user_roles = rbac::get_user_roles(&ctx.db, user.id).await?;
 
@@ -119,10 +112,7 @@ pub async fn my_roles(
 }
 
 /// Seed default system roles
-pub async fn seed_defaults(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn seed_defaults(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "roles:create").await?;
 

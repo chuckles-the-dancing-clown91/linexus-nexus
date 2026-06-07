@@ -66,11 +66,7 @@ impl Model {
     /// Seed default system roles
     pub async fn seed_defaults(db: &DatabaseConnection) -> ModelResult<()> {
         let defaults = vec![
-            (
-                "admin",
-                "Full system administrator",
-                vec!["*".to_string()],
-            ),
+            ("admin", "Full system administrator", vec!["*".to_string()]),
             (
                 "operator",
                 "Can create and manage tasks and agents",

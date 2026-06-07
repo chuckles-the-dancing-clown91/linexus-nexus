@@ -37,10 +37,7 @@ impl From<tasks::Model> for TaskResponse {
 }
 
 /// List all tasks
-pub async fn list(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn list(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "tasks:read").await?;
 
@@ -89,8 +86,7 @@ pub async fn get_one(
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "tasks:read").await?;
 
-    let uuid = uuid::Uuid::parse_str(&task_id)
-        .map_err(|e| loco_rs::Error::Any(e.into()))?;
+    let uuid = uuid::Uuid::parse_str(&task_id).map_err(|e| loco_rs::Error::Any(e.into()))?;
     let task = tasks::Model::find_by_task_id(&ctx.db, &uuid).await?;
     format::json(TaskResponse::from(task))
 }
@@ -104,8 +100,7 @@ pub async fn cancel(
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "tasks:cancel").await?;
 
-    let uuid = uuid::Uuid::parse_str(&task_id)
-        .map_err(|e| loco_rs::Error::Any(e.into()))?;
+    let uuid = uuid::Uuid::parse_str(&task_id).map_err(|e| loco_rs::Error::Any(e.into()))?;
     let task = tasks::Model::find_by_task_id(&ctx.db, &uuid).await?;
     let updated = task.update_status(&ctx.db, "cancelled").await?;
     format::json(TaskResponse::from(updated))

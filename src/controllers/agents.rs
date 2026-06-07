@@ -36,10 +36,7 @@ impl From<agents::Model> for AgentResponse {
 }
 
 /// List all agents
-pub async fn list(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn list(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "agents:read").await?;
 
@@ -57,8 +54,7 @@ pub async fn get_one(
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "agents:read").await?;
 
-    let uuid = uuid::Uuid::parse_str(&agent_id)
-        .map_err(|e| loco_rs::Error::Any(e.into()))?;
+    let uuid = uuid::Uuid::parse_str(&agent_id).map_err(|e| loco_rs::Error::Any(e.into()))?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     format::json(AgentResponse::from(agent))
 }
@@ -86,8 +82,7 @@ pub async fn heartbeat(
     Path(agent_id): Path<String>,
     State(ctx): State<AppContext>,
 ) -> Result<Response> {
-    let uuid = uuid::Uuid::parse_str(&agent_id)
-        .map_err(|e| loco_rs::Error::Any(e.into()))?;
+    let uuid = uuid::Uuid::parse_str(&agent_id).map_err(|e| loco_rs::Error::Any(e.into()))?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     let updated = agent.heartbeat(&ctx.db).await?;
     format::json(AgentResponse::from(updated))

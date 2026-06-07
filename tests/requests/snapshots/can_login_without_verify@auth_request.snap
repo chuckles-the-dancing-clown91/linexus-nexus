@@ -2,4 +2,4 @@
 source: tests/requests/auth.rs
 expression: login_response.text()
 ---
-"{\"token\":\"TOKEN\",\"pid\":\"PID\",\"name\":\"loco\",\"is_verified\":false}"
+"{\"token\":\"TOKEN\",\"pid\":\"PID\",\"name\":\"loco\",\"is_verified\":false,\"plan\":\"free\",\"roles\":[\"viewer\"],\"permissions\":[\"agents:read\",\"roles:read\",\"tasks:read\"]}"

@@ -7,6 +7,7 @@ mod m20240101_000003_user_roles;
 mod m20240101_000004_agents;
 mod m20240101_000005_tasks;
 mod m20240101_000006_casbin_rules;
+mod m20240101_000007_add_plan_to_users;
 
 pub struct Migrator;
 
@@ -20,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000004_agents::Migration),
             Box::new(m20240101_000005_tasks::Migration),
             Box::new(m20240101_000006_casbin_rules::Migration),
+            Box::new(m20240101_000007_add_plan_to_users::Migration),
             // inject-above (do not remove this comment)
         ]
     }

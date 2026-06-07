@@ -24,6 +24,15 @@ pub struct Model {
     pub email_verified_at: Option<DateTimeWithTimeZone>,
     pub magic_link_token: Option<String>,
     pub magic_link_expiration: Option<DateTimeWithTimeZone>,
+    #[sea_orm(default_value = "free")]
+    #[serde(default = "default_plan")]
+    pub plan: String,
+}
+
+/// Serde default for the `plan` column so fixtures/payloads omitting it
+/// deserialize to the free tier (matches the DB column default).
+fn default_plan() -> String {
+    "free".to_string()
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
