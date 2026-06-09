@@ -319,6 +319,42 @@ pub async fn get_standing(
     })
 }
 
+/// The current user's own standing, authenticated by their human JWT (no system
+/// token needed). Finds the node owned by this user, commissioning one on first
+/// access, then returns its live wallet, recent contributions, and the floor.
+/// This is what an operator console reads to show real numbers instead of mocks.
+pub async fn me_standing(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
+    let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
+
+    let node = match nodes::Model::find_by_owner(&ctx.db, user.id).await? {
+        Some(n) => n,
+        None => {
+            let params = nodes::CommissionParams {
+                class: "human".to_string(),
+                label: user.name.clone(),
+                lifecycle_phase: Some("labor".to_string()),
+                capabilities: None,
+                public_key: None,
+                owner_user_id: Some(user.id),
+                source: Some("nexus".to_string()),
+                external_ref: Some(user.pid.to_string()),
+            };
+            nodes::Model::commission(&ctx.db, &params).await?
+        }
+    };
+
+    let uuid = node.node_id;
+    let wallet = wallet_response(&ctx, uuid).await?;
+    let recent = contributions::Model::recent_for_node(&ctx.db, uuid, 20).await?;
+    let recent_contributions = recent.into_iter().map(ContributionResponse::from).collect();
+    format::json(StandingResponse {
+        node: NodeResponse::from(node),
+        wallet,
+        recent_contributions,
+        floor: FloorResponse::default(),
+    })
+}
+
 /// Sweep decayed lots and report the amount lost to decay.
 pub async fn sweep_wallet(
     State(ctx): State<AppContext>,
@@ -493,6 +529,7 @@ pub fn routes() -> Routes {
     Routes::new()
         .prefix("api/nexus")
         .add("/parameters", get(parameters))
+        .add("/me/standing", get(me_standing))
         .add("/nodes", get(list_nodes))
         .add("/nodes", post(create_node))
         .add("/nodes/{node_id}", get(get_node))

@@ -60,6 +60,21 @@ impl Model {
             .await?)
     }
 
+    /// Find the node owned by a given Nexus user, if any.
+    pub async fn find_by_owner(
+        db: &DatabaseConnection,
+        owner_user_id: i32,
+    ) -> ModelResult<Option<Self>> {
+        Ok(nodes::Entity::find()
+            .filter(
+                model::query::condition()
+                    .eq(nodes::Column::OwnerUserId, owner_user_id)
+                    .build(),
+            )
+            .one(db)
+            .await?)
+    }
+
     /// List all nodes, newest first.
     pub async fn find_all(db: &DatabaseConnection) -> ModelResult<Vec<Self>> {
         Ok(nodes::Entity::find()
