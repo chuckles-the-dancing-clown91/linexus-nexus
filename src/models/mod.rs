@@ -1,6 +1,11 @@
 pub mod _entities;
 pub mod agents;
+pub mod contributions;
+pub mod nodes;
+pub mod payments;
 pub mod plans;
 pub mod roles;
+pub mod system_tokens;
 pub mod tasks;
 pub mod users;
+pub mod wallet;

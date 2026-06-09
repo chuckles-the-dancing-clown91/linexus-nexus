@@ -8,6 +8,11 @@ mod m20240101_000004_agents;
 mod m20240101_000005_tasks;
 mod m20240101_000006_casbin_rules;
 mod m20240101_000007_add_plan_to_users;
+mod m20240101_000008_nodes;
+mod m20240101_000009_demiurge_lots;
+mod m20240101_000010_contributions;
+mod m20240101_000011_payments;
+mod m20240101_000012_system_tokens;
 
 pub struct Migrator;
 
@@ -22,6 +27,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000005_tasks::Migration),
             Box::new(m20240101_000006_casbin_rules::Migration),
             Box::new(m20240101_000007_add_plan_to_users::Migration),
+            Box::new(m20240101_000008_nodes::Migration),
+            Box::new(m20240101_000009_demiurge_lots::Migration),
+            Box::new(m20240101_000010_contributions::Migration),
+            Box::new(m20240101_000011_payments::Migration),
+            Box::new(m20240101_000012_system_tokens::Migration),
             // inject-above (do not remove this comment)
         ]
     }
