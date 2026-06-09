@@ -1,9 +1,10 @@
-//! # Subscription Plan Tiers
+//! # Entitlement Tiers
 //!
-//! Plans are a feature-gating axis layered on top of RBAC. Every user has a
-//! `plan` (stored on the users row); each plan maps to a bundle of permissions
-//! and a baseline role. There is **no payment** involved — switching plans is a
-//! self-service entitlement change (see `controllers::subscription`).
+//! An internal RBAC feature-gating axis. Every user has a `plan` (stored on the
+//! users row); each tier maps to a bundle of permissions and a baseline role.
+//! This is **not a subscription** and involves **no payment** — paid membership
+//! and donations are handled entirely off-nexus on the community social website.
+//! The tier here is set administratively and only shapes authorization.
 //!
 //! Effective permissions for a user are the union of:
 //!   1. permissions granted by their assigned roles (`user_roles` → `roles`)

@@ -123,7 +123,6 @@ impl Hooks for App {
             .add_route(controllers::tasks::routes())
             .add_route(controllers::agents::routes())
             .add_route(controllers::roles::routes())
-            .add_route(controllers::subscription::routes())
     }
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
         queue.register(DownloadWorker::build(ctx)).await?;
