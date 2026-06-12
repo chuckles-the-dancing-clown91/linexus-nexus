@@ -81,11 +81,7 @@ pub async fn lots(
 }
 
 /// Balance as of `now_unix`: the sum of every lot that has not yet decayed.
-pub async fn balance(
-    db: &DatabaseConnection,
-    node_id: Uuid,
-    now_unix: i64,
-) -> ModelResult<i64> {
+pub async fn balance(db: &DatabaseConnection, node_id: Uuid, now_unix: i64) -> ModelResult<i64> {
     let lots = lots(db, node_id).await?;
     Ok(lots
         .iter()

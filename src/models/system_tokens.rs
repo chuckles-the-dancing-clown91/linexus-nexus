@@ -56,11 +56,7 @@ impl Model {
         service: &str,
         scopes: &str,
     ) -> ModelResult<(Self, String)> {
-        let plaintext = format!(
-            "nx_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
+        let plaintext = format!("nx_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let row = system_tokens::ActiveModel {
             token_id: ActiveValue::set(Uuid::new_v4()),
             service: ActiveValue::set(service.to_string()),

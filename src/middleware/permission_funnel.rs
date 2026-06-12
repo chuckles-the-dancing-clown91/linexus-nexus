@@ -102,18 +102,15 @@ pub async fn evaluate(
     // For now, if the RBAC check passes, resource-level access is granted.
 
     // === Tier 4: Step-Up Authentication ===
-    if intent.is_destructive {
-        if step_up_token.is_none() {
-            return Ok(FunnelResult {
-                allowed: false,
-                denied_at_tier: Some(4),
-                reason: Some(
-                    "Step-up authentication required for destructive operations".to_string(),
-                ),
-            });
-        }
-        // TODO: Verify the step-up token against the auth system.
-        // For now, any non-empty token is accepted.
+    // Destructive operations require a step-up token.
+    // TODO: Verify the step-up token against the auth system.
+    // For now, any non-empty token is accepted.
+    if intent.is_destructive && step_up_token.is_none() {
+        return Ok(FunnelResult {
+            allowed: false,
+            denied_at_tier: Some(4),
+            reason: Some("Step-up authentication required for destructive operations".to_string()),
+        });
     }
 
     Ok(FunnelResult {

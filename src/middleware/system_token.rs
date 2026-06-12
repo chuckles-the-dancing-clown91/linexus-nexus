@@ -96,11 +96,7 @@ pub async fn authenticate(ctx: &AppContext, headers: &HeaderMap) -> Result<Syste
 /// ```rust,ignore
 /// let svc = system_token::require(&ctx, &headers, "nodes:create").await?;
 /// ```
-pub async fn require(
-    ctx: &AppContext,
-    headers: &HeaderMap,
-    scope: &str,
-) -> Result<SystemContext> {
+pub async fn require(ctx: &AppContext, headers: &HeaderMap, scope: &str) -> Result<SystemContext> {
     let svc = authenticate(ctx, headers).await?;
     if svc.has_scope(scope) {
         Ok(svc)

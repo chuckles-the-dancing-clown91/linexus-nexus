@@ -62,7 +62,9 @@ impl Model {
         params: &RecordParams,
     ) -> ModelResult<(Self, i64)> {
         let kind = ContributionKind::from_str_lenient(&params.kind);
-        let at_unix = params.at_unix.unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let at_unix = params
+            .at_unix
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
         let minutes = params.minutes.max(0);
 
         let prior = Self::prior_work_minutes(db, params.node_id, params.week_index).await?;
