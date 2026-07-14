@@ -99,6 +99,24 @@ impl Model {
                     "audit:read".to_string(),
                 ],
             ),
+            (
+                "housing_manager",
+                "Manages housing nodes, units, maintenance and docs",
+                vec![
+                    "housing:read".to_string(),
+                    "housing:write".to_string(),
+                ],
+            ),
+            (
+                "council",
+                "Civic authority over housing activation, reviews and resident assignment",
+                vec![
+                    "housing:read".to_string(),
+                    "housing:review".to_string(),
+                    "housing:assign".to_string(),
+                    "housing:vacate".to_string(),
+                ],
+            ),
         ];
 
         for (name, desc, perms) in defaults {

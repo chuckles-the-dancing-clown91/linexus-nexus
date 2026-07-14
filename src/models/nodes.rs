@@ -114,4 +114,12 @@ impl Model {
 
         Ok(node)
     }
+
+    pub fn is_council(&self) -> bool {
+        self.class == "council"
+    }
+
+    pub fn is_housing(&self) -> bool {
+        self.class == "housing"
+    }
 }

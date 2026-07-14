@@ -13,6 +13,14 @@ mod m20240101_000009_demiurge_lots;
 mod m20240101_000010_contributions;
 mod m20240101_000011_payments;
 mod m20240101_000012_system_tokens;
+mod m20240101_000013_support_sessions;
+mod m20240101_000014_housing_nodes;
+mod m20240101_000015_housing_units;
+mod m20240101_000016_housing_council_reviews;
+mod m20240101_000017_housing_occupancies;
+mod m20240101_000018_housing_queue;
+mod m20240101_000019_housing_maintenance;
+mod m20240101_000020_housing_documents;
 
 pub struct Migrator;
 
@@ -32,6 +40,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000010_contributions::Migration),
             Box::new(m20240101_000011_payments::Migration),
             Box::new(m20240101_000012_system_tokens::Migration),
+            Box::new(m20240101_000013_support_sessions::Migration),
+            Box::new(m20240101_000014_housing_nodes::Migration),
+            Box::new(m20240101_000015_housing_units::Migration),
+            Box::new(m20240101_000016_housing_council_reviews::Migration),
+            Box::new(m20240101_000017_housing_occupancies::Migration),
+            Box::new(m20240101_000018_housing_queue::Migration),
+            Box::new(m20240101_000019_housing_maintenance::Migration),
+            Box::new(m20240101_000020_housing_documents::Migration),
             // inject-above (do not remove this comment)
         ]
     }

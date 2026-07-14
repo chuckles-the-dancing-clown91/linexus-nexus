@@ -57,6 +57,7 @@ pub fn catalog() -> Vec<PlanInfo> {
                 "agents:read",
                 "agents:enroll",
                 "roles:read",
+                "housing:read",
             ],
         },
         PlanInfo {
