@@ -44,9 +44,11 @@ impl Model {
     }
 
     /// Create a document.
-    pub async fn create(db: &DatabaseConnection, params: &CreateDocumentParams) -> ModelResult<Self> {
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+    pub async fn create(
+        db: &DatabaseConnection,
+        params: &CreateDocumentParams,
+    ) -> ModelResult<Self> {
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let doc = housing_documents::ActiveModel {
             document_id: sea_orm::ActiveValue::set(Uuid::new_v4()),

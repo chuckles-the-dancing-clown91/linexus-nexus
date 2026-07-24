@@ -102,10 +102,7 @@ impl Model {
             (
                 "housing_manager",
                 "Manages housing nodes, units, maintenance and docs",
-                vec![
-                    "housing:read".to_string(),
-                    "housing:write".to_string(),
-                ],
+                vec!["housing:read".to_string(), "housing:write".to_string()],
             ),
             (
                 "council",

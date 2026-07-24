@@ -1,7 +1,7 @@
 //! Housing units model — individual occupiable spaces within a housing node.
 
 use loco_rs::prelude::*;
-use sea_orm::{ActiveValue, QueryOrder, ConnectionTrait};
+use sea_orm::{ActiveValue, ConnectionTrait, QueryOrder};
 use serde::{Deserialize, Serialize};
 
 pub use super::_entities::housing_units::{self, ActiveModel, Entity, Model};

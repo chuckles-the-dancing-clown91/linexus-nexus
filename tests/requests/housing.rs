@@ -50,7 +50,9 @@ async fn member_with_role(
     // Roles are seeded at boot, but seed again defensively (idempotent).
     roles::Model::seed_defaults(&ctx.db).await.unwrap();
     let member = register_login(request, ctx, name, email).await;
-    rbac::assign_role(&ctx.db, member.user.id, role).await.unwrap();
+    rbac::assign_role(&ctx.db, member.user.id, role)
+        .await
+        .unwrap();
     nodes::Model::commission(
         &ctx.db,
         &nodes::CommissionParams {
@@ -79,7 +81,12 @@ fn bearer(token: &str) -> (HeaderName, HeaderValue) {
 async fn get_json(request: &TestServer, path: &str, token: &str) -> serde_json::Value {
     let (k, v) = bearer(token);
     let response = request.get(path).add_header(k, v).await;
-    assert_eq!(response.status_code(), 200, "GET {path} failed: {}", response.text());
+    assert_eq!(
+        response.status_code(),
+        200,
+        "GET {path} failed: {}",
+        response.text()
+    );
     serde_json::from_str(&response.text()).unwrap()
 }
 
@@ -103,7 +110,12 @@ async fn activate_block(
             "unit_count": 2
         }))
         .await;
-    assert_eq!(response.status_code(), 200, "create node: {}", response.text());
+    assert_eq!(
+        response.status_code(),
+        200,
+        "create node: {}",
+        response.text()
+    );
     let node: serde_json::Value = serde_json::from_str(&response.text()).unwrap();
     assert_eq!(node["status"], "draft");
     assert_eq!(node["quorum_required"], 2);
@@ -122,7 +134,11 @@ async fn activate_block(
 
     // Draft-node units must NOT be in the commons queue yet.
     let queue = get_json(request, "/api/housing/queue", &manager.token).await;
-    assert_eq!(queue.as_array().unwrap().len(), 0, "queue must stay empty pre-activation");
+    assert_eq!(
+        queue.as_array().unwrap().len(),
+        0,
+        "queue must stay empty pre-activation"
+    );
 
     let (k, v) = bearer(&manager.token);
     let response = request
@@ -160,7 +176,11 @@ async fn housing_endpoints_require_permission() {
         let plain = register_login(&request, &ctx, "icarus", "icarus@corridor.north").await;
         let (k, v) = bearer(&plain.token);
         let response = request.get("/api/housing/nodes").add_header(k, v).await;
-        assert_eq!(response.status_code(), 401, "free user must lack housing:read");
+        assert_eq!(
+            response.status_code(),
+            401,
+            "free user must lack housing:read"
+        );
 
         let (k, v) = bearer(&plain.token);
         let response = request
@@ -170,7 +190,11 @@ async fn housing_endpoints_require_permission() {
                 "name": "x", "address": "x", "property_type": "condo", "unit_count": 1
             }))
             .await;
-        assert_eq!(response.status_code(), 401, "free user must lack housing:write");
+        assert_eq!(
+            response.status_code(),
+            401,
+            "free user must lack housing:write"
+        );
     })
     .await;
 }
@@ -180,15 +204,30 @@ async fn housing_endpoints_require_permission() {
 async fn lifecycle_quorum_activates_and_mints_civic_labor() {
     request::<App, _, _>(|request, ctx| async move {
         let manager = member_with_role(
-            &request, &ctx, "daedalus", "daedalus@corridor.north", "housing_manager", "human",
+            &request,
+            &ctx,
+            "daedalus",
+            "daedalus@corridor.north",
+            "housing_manager",
+            "human",
         )
         .await;
         let ariadne = member_with_role(
-            &request, &ctx, "ariadne", "ariadne@corridor.north", "council", "council",
+            &request,
+            &ctx,
+            "ariadne",
+            "ariadne@corridor.north",
+            "council",
+            "council",
         )
         .await;
         let minos = member_with_role(
-            &request, &ctx, "minos", "minos@corridor.north", "council", "council",
+            &request,
+            &ctx,
+            "minos",
+            "minos@corridor.north",
+            "council",
+            "council",
         )
         .await;
 
@@ -230,8 +269,16 @@ async fn lifecycle_quorum_activates_and_mints_civic_labor() {
                 .await;
             assert_eq!(response.status_code(), 200);
 
-            let node = get_json(&request, &format!("/api/housing/nodes/{node_id}"), &manager.token).await;
-            assert_eq!(node["status"], "pending_council", "one approval must not meet quorum");
+            let node = get_json(
+                &request,
+                &format!("/api/housing/nodes/{node_id}"),
+                &manager.token,
+            )
+            .await;
+            assert_eq!(
+                node["status"], "pending_council",
+                "one approval must not meet quorum"
+            );
 
             (node_id, unit["id"].as_i64().unwrap())
         };
@@ -245,7 +292,12 @@ async fn lifecycle_quorum_activates_and_mints_civic_labor() {
             .await;
         assert_eq!(response.status_code(), 200);
 
-        let node = get_json(&request, &format!("/api/housing/nodes/{node_id}"), &manager.token).await;
+        let node = get_json(
+            &request,
+            &format!("/api/housing/nodes/{node_id}"),
+            &manager.token,
+        )
+        .await;
         assert_eq!(node["status"], "active");
         assert!(!node["activated_at"].is_null());
 
@@ -263,7 +315,10 @@ async fn lifecycle_quorum_activates_and_mints_civic_labor() {
         let balance = wallet::balance(&ctx.db, minos_node.node_id, chrono::Utc::now().timestamp())
             .await
             .unwrap();
-        assert!(balance > 0, "decisive council vote must mint civic-labor Demiurge");
+        assert!(
+            balance > 0,
+            "decisive council vote must mint civic-labor Demiurge"
+        );
 
         // Votes are idempotent — a re-vote records nothing new.
         let (k, v) = bearer(&minos.token);
@@ -273,9 +328,22 @@ async fn lifecycle_quorum_activates_and_mints_civic_labor() {
             .json(&serde_json::json!({ "vote": "reject" }))
             .await;
         assert_eq!(response.status_code(), 200);
-        let reviews = get_json(&request, &format!("/api/housing/nodes/{node_id}/reviews"), &manager.token).await;
-        assert_eq!(reviews.as_array().unwrap().len(), 2, "re-vote must not add a review");
-        assert!(reviews.as_array().unwrap().iter().all(|r| r["vote"] == "approve"));
+        let reviews = get_json(
+            &request,
+            &format!("/api/housing/nodes/{node_id}/reviews"),
+            &manager.token,
+        )
+        .await;
+        assert_eq!(
+            reviews.as_array().unwrap().len(),
+            2,
+            "re-vote must not add a review"
+        );
+        assert!(reviews
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["vote"] == "approve"));
     })
     .await;
 }
@@ -285,15 +353,30 @@ async fn lifecycle_quorum_activates_and_mints_civic_labor() {
 async fn assign_and_vacate_requeues_unit() {
     request::<App, _, _>(|request, ctx| async move {
         let manager = member_with_role(
-            &request, &ctx, "daedalus", "daedalus@corridor.north", "housing_manager", "human",
+            &request,
+            &ctx,
+            "daedalus",
+            "daedalus@corridor.north",
+            "housing_manager",
+            "human",
         )
         .await;
         let ariadne = member_with_role(
-            &request, &ctx, "ariadne", "ariadne@corridor.north", "council", "council",
+            &request,
+            &ctx,
+            "ariadne",
+            "ariadne@corridor.north",
+            "council",
+            "council",
         )
         .await;
         let minos = member_with_role(
-            &request, &ctx, "minos", "minos@corridor.north", "council", "council",
+            &request,
+            &ctx,
+            "minos",
+            "minos@corridor.north",
+            "council",
+            "council",
         )
         .await;
         let (_node_id, unit_id) =
@@ -323,7 +406,11 @@ async fn assign_and_vacate_requeues_unit() {
             .add_header(k, v)
             .json(&serde_json::json!({ "resident_node_id": theseus.id }))
             .await;
-        assert_eq!(response.status_code(), 401, "manager must lack housing:assign");
+        assert_eq!(
+            response.status_code(),
+            401,
+            "manager must lack housing:assign"
+        );
 
         // Council assigns Theseus to H-12.
         let (k, v) = bearer(&ariadne.token);
@@ -338,7 +425,11 @@ async fn assign_and_vacate_requeues_unit() {
         assert!(occupancy["vacated_at"].is_null());
 
         let queue = get_json(&request, "/api/housing/queue", &manager.token).await;
-        assert_eq!(queue.as_array().unwrap().len(), 0, "assigned unit must leave the queue");
+        assert_eq!(
+            queue.as_array().unwrap().len(),
+            0,
+            "assigned unit must leave the queue"
+        );
 
         // Double-assignment of an occupied unit must fail.
         let (k, v) = bearer(&ariadne.token);
@@ -347,7 +438,11 @@ async fn assign_and_vacate_requeues_unit() {
             .add_header(k, v)
             .json(&serde_json::json!({ "resident_node_id": theseus.id }))
             .await;
-        assert_ne!(response.status_code(), 200, "occupied unit must refuse assignment");
+        assert_ne!(
+            response.status_code(),
+            200,
+            "occupied unit must refuse assignment"
+        );
 
         // Vacate → occupancy closed, unit make_ready, unit re-queued.
         let (k, v) = bearer(&ariadne.token);
@@ -373,7 +468,12 @@ async fn assign_and_vacate_requeues_unit() {
 async fn non_council_cannot_review() {
     request::<App, _, _>(|request, ctx| async move {
         let manager = member_with_role(
-            &request, &ctx, "daedalus", "daedalus@corridor.north", "housing_manager", "human",
+            &request,
+            &ctx,
+            "daedalus",
+            "daedalus@corridor.north",
+            "housing_manager",
+            "human",
         )
         .await;
 
@@ -404,7 +504,11 @@ async fn non_council_cannot_review() {
             .add_header(k, v)
             .json(&serde_json::json!({ "vote": "approve" }))
             .await;
-        assert_eq!(response.status_code(), 401, "manager must not hold housing:review");
+        assert_eq!(
+            response.status_code(),
+            401,
+            "manager must not hold housing:review"
+        );
     })
     .await;
 }

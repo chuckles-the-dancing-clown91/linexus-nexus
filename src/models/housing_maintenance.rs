@@ -37,7 +37,10 @@ impl Model {
         Ok(housing_maintenance_tickets::Entity::find()
             .filter(
                 model::query::condition()
-                    .eq(housing_maintenance_tickets::Column::HousingUnitId, housing_unit_id)
+                    .eq(
+                        housing_maintenance_tickets::Column::HousingUnitId,
+                        housing_unit_id,
+                    )
                     .build(),
             )
             .order_by_desc(housing_maintenance_tickets::Column::OpenedAt)
@@ -61,8 +64,7 @@ impl Model {
 
     /// Create a maintenance ticket.
     pub async fn create(db: &DatabaseConnection, params: &CreateTicketParams) -> ModelResult<Self> {
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let ticket = housing_maintenance_tickets::ActiveModel {
             ticket_id: ActiveValue::set(Uuid::new_v4()),
@@ -95,8 +97,7 @@ impl Model {
         let mut active: housing_maintenance_tickets::ActiveModel = ticket.into();
         active.status = ActiveValue::set(status.to_string());
         if status == "resolved" || status == "closed" {
-            let now: chrono::DateTime<chrono::FixedOffset> =
-                chrono::Utc::now().fixed_offset().into();
+            let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
             active.resolved_at = ActiveValue::set(Some(now));
         }
         if let Some(n) = notes {

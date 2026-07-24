@@ -1,5 +1,5 @@
 use loco_rs::prelude::*;
-use sea_orm::{ActiveValue, QueryOrder, ConnectionTrait, PaginatorTrait};
+use sea_orm::{ActiveValue, ConnectionTrait, PaginatorTrait, QueryOrder};
 use uuid::Uuid;
 
 pub use super::_entities::housing_queue::{self, ActiveModel, Entity, Model};
@@ -49,8 +49,7 @@ impl Model {
             return Ok(existing);
         }
 
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let entry = housing_queue::ActiveModel {
             queue_id: ActiveValue::set(Uuid::new_v4()),
@@ -78,8 +77,7 @@ impl Model {
     ) -> ModelResult<()> {
         let entry = Self::find_for_unit(db, housing_unit_id).await?;
         if let Some(entry) = entry {
-            let now: chrono::DateTime<chrono::FixedOffset> =
-                chrono::Utc::now().fixed_offset().into();
+            let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
             let mut active: housing_queue::ActiveModel = entry.into();
             active.status = ActiveValue::set("assigned".to_string());
             active.claimed_at = ActiveValue::set(Some(now));

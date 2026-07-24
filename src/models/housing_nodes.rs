@@ -50,6 +50,8 @@ impl HousingStatus {
         }
     }
 
+    // Inherent `from_str` returning Option (not the fallible FromStr trait).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "draft" => Some(Self::Draft),
@@ -135,10 +137,7 @@ impl Model {
     }
 
     /// List housing nodes by status.
-    pub async fn find_by_status(
-        db: &DatabaseConnection,
-        status: &str,
-    ) -> ModelResult<Vec<Self>> {
+    pub async fn find_by_status(db: &DatabaseConnection, status: &str) -> ModelResult<Vec<Self>> {
         Ok(housing_nodes::Entity::find()
             .filter(
                 model::query::condition()
@@ -208,12 +207,10 @@ impl Model {
 
         match next {
             HousingStatus::PendingCouncil => {
-                active.submitted_at =
-                    ActiveValue::set(Some(chrono::Utc::now().fixed_offset().into()));
+                active.submitted_at = ActiveValue::set(Some(chrono::Utc::now().fixed_offset()));
             }
             HousingStatus::Active => {
-                active.activated_at =
-                    ActiveValue::set(Some(chrono::Utc::now().fixed_offset().into()));
+                active.activated_at = ActiveValue::set(Some(chrono::Utc::now().fixed_offset()));
             }
             _ => {}
         }
@@ -224,10 +221,7 @@ impl Model {
     /// Check if the quorum has been met for `pending_council` nodes.
     /// If so, automatically transitions the node to `active` within a
     /// transaction and returns the updated model.
-    pub async fn check_and_activate(
-        db: &DatabaseConnection,
-        id: i32,
-    ) -> ModelResult<Option<Self>> {
+    pub async fn check_and_activate(db: &DatabaseConnection, id: i32) -> ModelResult<Option<Self>> {
         let node = Self::find_by_id(db, id).await?;
         if node.status != HousingStatus::PendingCouncil.as_str() {
             return Ok(None);
@@ -241,8 +235,7 @@ impl Model {
             let units = super::housing_units::Model::find_for_node(db, id).await?;
             for unit in &units {
                 if unit.status == super::housing_units::UnitStatus::Available.as_str() {
-                    super::housing_queue::Model::enqueue(db, unit.id, &unit.unit_number, 0)
-                        .await?;
+                    super::housing_queue::Model::enqueue(db, unit.id, &unit.unit_number, 0).await?;
                 }
             }
             Ok(Some(activated))

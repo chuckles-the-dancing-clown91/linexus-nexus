@@ -64,7 +64,10 @@ impl Model {
         Ok(housing_occupancies::Entity::find()
             .filter(
                 model::query::condition()
-                    .eq(housing_occupancies::Column::ResidentNodeId, resident_node_id)
+                    .eq(
+                        housing_occupancies::Column::ResidentNodeId,
+                        resident_node_id,
+                    )
                     .is_null(housing_occupancies::Column::VacatedAt)
                     .build(),
             )
@@ -89,8 +92,7 @@ impl Model {
             return Err(ModelError::msg("unit is already occupied"));
         }
 
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let occupancy = housing_occupancies::ActiveModel {
             occupancy_id: ActiveValue::set(Uuid::new_v4()),
@@ -109,12 +111,8 @@ impl Model {
         housing_units::Model::set_status(&txn, params.housing_unit_id, "occupied").await?;
 
         // Close the queue entry for this unit.
-        housing_queue::Model::mark_assigned(
-            &txn,
-            params.housing_unit_id,
-            params.resident_node_id,
-        )
-        .await?;
+        housing_queue::Model::mark_assigned(&txn, params.housing_unit_id, params.resident_node_id)
+            .await?;
 
         txn.commit().await?;
         Ok(occupancy)
@@ -135,8 +133,7 @@ impl Model {
             .await?
             .ok_or_else(|| ModelError::msg("unit is not currently occupied"))?;
 
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let mut active: housing_occupancies::ActiveModel = occupancy.into();
         if let Some(n) = notes {

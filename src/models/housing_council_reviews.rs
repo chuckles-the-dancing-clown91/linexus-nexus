@@ -6,7 +6,7 @@
 //! supported — the immutable ledger guarantees audit integrity.
 
 use loco_rs::prelude::*;
-use sea_orm::{ActiveValue, PaginatorTrait, ConnectionTrait};
+use sea_orm::{ActiveValue, ConnectionTrait, PaginatorTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,7 +32,10 @@ impl Model {
         Ok(housing_council_reviews::Entity::find()
             .filter(
                 model::query::condition()
-                    .eq(housing_council_reviews::Column::HousingNodeId, housing_node_id)
+                    .eq(
+                        housing_council_reviews::Column::HousingNodeId,
+                        housing_node_id,
+                    )
                     .build(),
             )
             .all(db)
@@ -47,7 +50,10 @@ impl Model {
         let count = housing_council_reviews::Entity::find()
             .filter(
                 model::query::condition()
-                    .eq(housing_council_reviews::Column::HousingNodeId, housing_node_id)
+                    .eq(
+                        housing_council_reviews::Column::HousingNodeId,
+                        housing_node_id,
+                    )
                     .eq(housing_council_reviews::Column::Vote, "approve")
                     .build(),
             )
@@ -65,8 +71,14 @@ impl Model {
         Ok(housing_council_reviews::Entity::find()
             .filter(
                 model::query::condition()
-                    .eq(housing_council_reviews::Column::HousingNodeId, housing_node_id)
-                    .eq(housing_council_reviews::Column::ReviewerNodeId, reviewer_node_id)
+                    .eq(
+                        housing_council_reviews::Column::HousingNodeId,
+                        housing_node_id,
+                    )
+                    .eq(
+                        housing_council_reviews::Column::ReviewerNodeId,
+                        reviewer_node_id,
+                    )
                     .build(),
             )
             .one(db)
@@ -91,8 +103,7 @@ impl Model {
             return Err(ModelError::msg("vote must be 'approve' or 'reject'"));
         }
 
-        let now: chrono::DateTime<chrono::FixedOffset> =
-            chrono::Utc::now().fixed_offset().into();
+        let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().fixed_offset();
 
         let review = housing_council_reviews::ActiveModel {
             review_id: ActiveValue::set(Uuid::new_v4()),
