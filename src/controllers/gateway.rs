@@ -198,7 +198,10 @@ pub async fn create_task(
 
     let task = match gateway_client::plan_task(&plan_body).await {
         Ok(plan) => {
-            let plan_str = serde_json::to_string(&plan).unwrap_or_default();
+            // Store just the TransactionPlan (the orchestrator wraps it in a
+            // PlanResponse envelope) so the agent poll can hand it over directly.
+            let plan_obj = plan.get("plan").cloned().unwrap_or(plan);
+            let plan_str = serde_json::to_string(&plan_obj).unwrap_or_default();
             task.set_plan(&ctx.db, &plan_str, "planned").await?
         }
         Err(e) => {
@@ -314,6 +317,147 @@ pub async fn heartbeat(
     format::json(agent_json(&updated))
 }
 
+// ---------------------------------------------------------------------------
+// Agent task loop: poll for work, report results, ship logs (all via Nexus, so
+// the agent never talks to the Orchestrator or Logger directly).
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/agents/{id}/tasks` — planned/dispatched tasks targeting this
+/// agent, each with its TransactionPlan. Handing a plan over transitions the
+/// task from `planned` to `dispatched`.
+pub async fn poll_tasks(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let uuid = parse_uuid(&id)?;
+    let pending = tasks::Model::find_pending_for_agent(&ctx.db, &uuid.to_string()).await?;
+
+    let mut out = Vec::with_capacity(pending.len());
+    for t in pending {
+        let plan = t
+            .plan
+            .as_ref()
+            .and_then(|p| serde_json::from_str::<Value>(p).ok())
+            .unwrap_or(Value::Null);
+        out.push(json!({
+            "taskId": t.task_id.to_string(),
+            "intent": t.intent.clone(),
+            "status": t.status.clone(),
+            "autoRollback": plan.get("auto_rollback").and_then(Value::as_bool).unwrap_or(false),
+            "plan": plan,
+        }));
+        // Best-effort: mark dispatched so it isn't treated as freshly planned.
+        if let Err(e) = t.mark_dispatched(&ctx.db).await {
+            tracing::warn!(error = %e, "failed to mark task dispatched");
+        }
+    }
+    format::json(out)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResultRequest {
+    /// `success` or `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `POST /api/v1/agents/{id}/tasks/{task_id}/result` — record a terminal task
+/// result reported by the agent, and surface it in the operational log.
+pub async fn report_result(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<TaskResultRequest>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    parse_uuid(&id)?;
+    let tid = parse_uuid(&task_id)?;
+
+    let task = tasks::Model::find_by_task_id(&ctx.db, &tid).await?;
+    let final_status = if req.status == "success" {
+        "completed"
+    } else {
+        "failed"
+    };
+    let updated = task
+        .complete(&ctx.db, final_status, req.error.as_deref())
+        .await?;
+
+    let audit = json!({
+        "agent_id": id,
+        "task_id": task_id,
+        "level": if final_status == "failed" { "error" } else { "info" },
+        "source": "agent",
+        "message": req.message.unwrap_or_else(|| format!("task {final_status}")),
+    });
+    if let Err(e) = gateway_client::ship_log(&audit).await {
+        tracing::warn!(error = %e, "failed to ship task-result audit log");
+    }
+
+    format::json(json!({ "taskId": updated.task_id.to_string(), "status": updated.status }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShipLogEntry {
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ShipLogBody {
+    One(ShipLogEntry),
+    Many(Vec<ShipLogEntry>),
+}
+
+/// `POST /api/v1/agents/{id}/logs` — the agent ships journal lines; Nexus stamps
+/// the agent id and forwards them to the Logger. This is how agent logs reach
+/// the audit trail without the agent talking to the Logger directly.
+pub async fn ship_agent_logs(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ShipLogBody>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let uuid = parse_uuid(&id)?;
+
+    let entries = match body {
+        ShipLogBody::One(e) => vec![e],
+        ShipLogBody::Many(v) => v,
+    };
+    let mut ingested = 0usize;
+    for e in entries {
+        let entry = json!({
+            "agent_id": uuid.to_string(),
+            "task_id": e.task_id,
+            "level": e.level.unwrap_or_else(|| "info".to_string()),
+            "source": e.source.unwrap_or_else(|| "agent".to_string()),
+            "message": e.message,
+            "metadata": e.metadata,
+        });
+        gateway_client::ship_log(&entry)
+            .await
+            .map_err(|err| loco_rs::Error::Any(err.into()))?;
+        ingested += 1;
+    }
+    format::json(json!({ "ingested": ingested }))
+}
+
 pub fn routes() -> Routes {
     Routes::new()
         .prefix("api/v1")
@@ -322,6 +466,8 @@ pub fn routes() -> Routes {
         .add("/agents/{id}", get(get_agent))
         .add("/agents/{id}/report", post(report))
         .add("/agents/{id}/heartbeat", post(heartbeat))
-        .add("/agents/{id}/logs", get(agent_logs))
+        .add("/agents/{id}/logs", get(agent_logs).post(ship_agent_logs))
+        .add("/agents/{id}/tasks", get(poll_tasks))
+        .add("/agents/{id}/tasks/{task_id}/result", post(report_result))
         .add("/tasks", post(create_task))
 }

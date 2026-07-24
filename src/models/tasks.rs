@@ -80,4 +80,59 @@ impl Model {
         active.status = ActiveValue::set(status.to_string());
         Ok(active.update(db).await?)
     }
+
+    /// Tasks targeting `agent_id` that are planned or already dispatched (i.e.
+    /// ready for the agent to pick up and not yet completed). `target_agents` is
+    /// a JSON array; membership is checked in-process since the set is small.
+    pub async fn find_pending_for_agent(
+        db: &DatabaseConnection,
+        agent_id: &str,
+    ) -> ModelResult<Vec<Self>> {
+        let candidates = tasks::Entity::find()
+            .filter(tasks::Column::Status.is_in(["planned", "dispatched"]))
+            .all(db)
+            .await?;
+        Ok(candidates
+            .into_iter()
+            .filter(|t| task_targets_agent(t, agent_id))
+            .collect())
+    }
+
+    /// Transition a freshly planned task to `dispatched` once an agent has been
+    /// handed the plan. Idempotent: only `planned` tasks move.
+    pub async fn mark_dispatched(self, db: &DatabaseConnection) -> ModelResult<Self> {
+        if self.status != "planned" {
+            return Ok(self);
+        }
+        let mut active: tasks::ActiveModel = self.into();
+        active.status = ActiveValue::set("dispatched".to_string());
+        Ok(active.update(db).await?)
+    }
+
+    /// Record a terminal result reported by the agent: set `completed`/`failed`,
+    /// stamp completion, and store any error message.
+    pub async fn complete(
+        self,
+        db: &DatabaseConnection,
+        status: &str,
+        error: Option<&str>,
+    ) -> ModelResult<Self> {
+        let mut active: tasks::ActiveModel = self.into();
+        active.status = ActiveValue::set(status.to_string());
+        active.completed_at = ActiveValue::set(Some(chrono::Local::now().into()));
+        if let Some(e) = error {
+            active.error_message = ActiveValue::set(Some(e.to_string()));
+        }
+        Ok(active.update(db).await?)
+    }
+}
+
+/// Whether a task's `target_agents` JSON array names `agent_id`.
+fn task_targets_agent(t: &Model, agent_id: &str) -> bool {
+    match &t.target_agents {
+        Some(s) => serde_json::from_str::<Vec<String>>(s)
+            .map(|v| v.iter().any(|a| a == agent_id))
+            .unwrap_or(false),
+        None => false,
+    }
 }
