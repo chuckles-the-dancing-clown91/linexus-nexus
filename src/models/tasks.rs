@@ -67,4 +67,17 @@ impl Model {
         }
         Ok(active.update(db).await?)
     }
+
+    /// Store the orchestrator's plan (JSON) and set the status in one update.
+    pub async fn set_plan(
+        self,
+        db: &DatabaseConnection,
+        plan_json: &str,
+        status: &str,
+    ) -> ModelResult<Self> {
+        let mut active: tasks::ActiveModel = self.into();
+        active.plan = ActiveValue::set(Some(plan_json.to_string()));
+        active.status = ActiveValue::set(status.to_string());
+        Ok(active.update(db).await?)
+    }
 }

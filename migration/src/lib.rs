@@ -1,5 +1,10 @@
 #![allow(elided_lifetimes_in_paths)]
 #![allow(clippy::wildcard_imports)]
+// Mirror the main crate (src/lib.rs): pedantic/nursery are opinionated style
+// lints the codebase does not adopt wholesale, so allow them centrally here too
+// and keep the enforced surface at the default `clippy::all` set.
+#![allow(clippy::pedantic)]
+#![allow(clippy::nursery)]
 pub use sea_orm_migration::prelude::*;
 mod m20220101_000001_users;
 mod m20240101_000002_roles;
@@ -21,6 +26,7 @@ mod m20240101_000017_housing_occupancies;
 mod m20240101_000018_housing_queue;
 mod m20240101_000019_housing_maintenance;
 mod m20240101_000020_housing_documents;
+mod m20240101_000021_agent_facts;
 
 pub struct Migrator;
 
@@ -48,6 +54,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000018_housing_queue::Migration),
             Box::new(m20240101_000019_housing_maintenance::Migration),
             Box::new(m20240101_000020_housing_documents::Migration),
+            Box::new(m20240101_000021_agent_facts::Migration),
             // inject-above (do not remove this comment)
         ]
     }
