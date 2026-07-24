@@ -70,6 +70,7 @@ pub async fn enroll(
 
     let params = agents::EnrollAgentParams {
         hostname: req.hostname,
+        hostgroup: None,
         capability_manifest: req.capability_manifest,
     };
 

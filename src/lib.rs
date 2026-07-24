@@ -10,6 +10,7 @@ pub mod app;
 pub mod controllers;
 pub mod data;
 pub mod demiurge;
+pub mod gateway_client;
 pub mod initializers;
 pub mod mailers;
 pub mod middleware;

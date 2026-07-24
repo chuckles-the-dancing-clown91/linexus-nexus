@@ -1,7 +1,7 @@
 //! Housing units model — individual occupiable spaces within a housing node.
 
 use loco_rs::prelude::*;
-use sea_orm::{ActiveValue, QueryOrder, ConnectionTrait};
+use sea_orm::{ActiveValue, ConnectionTrait, QueryOrder};
 use serde::{Deserialize, Serialize};
 
 pub use super::_entities::housing_units::{self, ActiveModel, Entity, Model};
@@ -35,7 +35,7 @@ pub struct CreateUnitParams {
     #[serde(default)]
     pub beds: Option<i32>,
     #[serde(default)]
-    pub baths: Option<f64>,
+    pub baths: Option<f32>,
     #[serde(default)]
     pub sqft: Option<i32>,
     #[serde(default)]

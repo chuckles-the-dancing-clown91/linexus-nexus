@@ -22,6 +22,9 @@ pub struct Model {
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message: Option<String>,
+    /// The orchestrator's TransactionPlan (JSON), stored when the task is planned.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub plan: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

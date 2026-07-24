@@ -9,9 +9,8 @@ use uuid::Uuid;
 
 use crate::middleware::rbac;
 use crate::models::{
-    contributions, housing_nodes, housing_units, housing_council_reviews,
-    housing_occupancies, housing_queue, housing_maintenance,
-    housing_documents, nodes,
+    contributions, housing_council_reviews, housing_documents, housing_maintenance, housing_nodes,
+    housing_occupancies, housing_queue, housing_units, nodes,
 };
 
 // ── DTOs ──
@@ -50,7 +49,7 @@ pub struct VacateUnitRequest {
 pub struct CreateUnitRequest {
     pub unit_number: String,
     pub beds: Option<i32>,
-    pub baths: Option<f64>,
+    pub baths: Option<f32>,
     pub sqft: Option<i32>,
     pub notes: Option<String>,
 }
@@ -116,10 +115,7 @@ pub async fn create_node(
 }
 
 /// List all housing nodes
-pub async fn list_nodes(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn list_nodes(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "housing:read").await?;
 
@@ -149,7 +145,9 @@ pub async fn submit_node(
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "housing:write").await?;
 
-    let updated = housing_nodes::Model::transition(&ctx.db, id, housing_nodes::HousingStatus::PendingCouncil).await?;
+    let updated =
+        housing_nodes::Model::transition(&ctx.db, id, housing_nodes::HousingStatus::PendingCouncil)
+            .await?;
     format::json(updated)
 }
 
@@ -162,7 +160,9 @@ pub async fn archive_node(
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "housing:write").await?;
 
-    let updated = housing_nodes::Model::transition(&ctx.db, id, housing_nodes::HousingStatus::Archived).await?;
+    let updated =
+        housing_nodes::Model::transition(&ctx.db, id, housing_nodes::HousingStatus::Archived)
+            .await?;
     format::json(updated)
 }
 
@@ -225,7 +225,9 @@ pub async fn cast_vote(
     let reviewer_node = match nodes::Model::find_by_owner(&ctx.db, user.id).await? {
         Some(n) => n,
         None => {
-            return Err(loco_rs::Error::BadRequest("User has no associated node".to_string()));
+            return Err(loco_rs::Error::BadRequest(
+                "User has no associated node".to_string(),
+            ));
         }
     };
 
@@ -250,7 +252,10 @@ pub async fn cast_vote(
                 essential: false,
                 coverage: false,
                 week_index: at_unix / 604_800,
-                note: Some(format!("housing council · decisive vote · {}", activated.name)),
+                note: Some(format!(
+                    "housing council · decisive vote · {}",
+                    activated.name
+                )),
                 at_unix: Some(at_unix),
             };
             if let Err(err) = contributions::Model::record(&ctx.db, &mint).await {
@@ -313,10 +318,7 @@ pub async fn vacate_unit(
 }
 
 /// View the available units in the housing queue
-pub async fn get_queue(
-    auth: auth::JWT,
-    State(ctx): State<AppContext>,
-) -> Result<Response> {
+pub async fn get_queue(auth: auth::JWT, State(ctx): State<AppContext>) -> Result<Response> {
     let user = crate::models::users::Model::find_by_pid(&ctx.db, &auth.claims.pid).await?;
     rbac::require_permission(&ctx.db, user.id, "housing:read").await?;
 

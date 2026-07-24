@@ -92,6 +92,55 @@ pub async fn authenticate(ctx: &AppContext, headers: &HeaderMap) -> Result<Syste
     ))
 }
 
+/// Validate a raw token string, returning the calling service's context.
+/// Shared by the header and bearer entry points.
+pub async fn validate_token(ctx: &AppContext, token: &str) -> Result<SystemContext> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(loco_rs::Error::Unauthorized("empty token".to_string()));
+    }
+
+    if constant_time_eq(token, &root_token()) {
+        return Ok(SystemContext {
+            service: "root".to_string(),
+            scopes: vec!["*".to_string()],
+        });
+    }
+
+    let hash = system_tokens::hash_token(token);
+    if let Some(record) = system_tokens::Model::find_active_by_hash(&ctx.db, &hash).await? {
+        let scopes = record.scope_list();
+        let service = record.service.clone();
+        let _ = record.touch(&ctx.db).await;
+        return Ok(SystemContext { service, scopes });
+    }
+
+    Err(loco_rs::Error::Unauthorized(
+        "invalid system token".to_string(),
+    ))
+}
+
+/// Authenticate a request by its `Authorization: Bearer <token>` header.
+///
+/// This is the entry point Daedalus IT and agents use — they present the Nexus
+/// API key as a bearer token — as opposed to the `X-Nexus-System-Token` header
+/// used by the Demiurge publisher integration. Both resolve to the same token
+/// set (root token or a `system_tokens` row).
+pub async fn authenticate_bearer(ctx: &AppContext, headers: &HeaderMap) -> Result<SystemContext> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| loco_rs::Error::Unauthorized("missing bearer token".to_string()))?;
+
+    validate_token(ctx, token).await
+}
+
 /// Authenticate and require a specific scope. Use this to guard service routes:
 /// ```rust,ignore
 /// let svc = system_token::require(&ctx, &headers, "nodes:create").await?;
