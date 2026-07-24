@@ -35,7 +35,7 @@ pub struct CreateUnitParams {
     #[serde(default)]
     pub beds: Option<i32>,
     #[serde(default)]
-    pub baths: Option<f64>,
+    pub baths: Option<f32>,
     #[serde(default)]
     pub sqft: Option<i32>,
     #[serde(default)]

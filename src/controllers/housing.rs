@@ -49,7 +49,7 @@ pub struct VacateUnitRequest {
 pub struct CreateUnitRequest {
     pub unit_number: String,
     pub beds: Option<i32>,
-    pub baths: Option<f64>,
+    pub baths: Option<f32>,
     pub sqft: Option<i32>,
     pub notes: Option<String>,
 }

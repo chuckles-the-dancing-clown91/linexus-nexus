@@ -13,7 +13,9 @@ pub struct Model {
     pub housing_node_id: i32,
     pub unit_number: String,
     pub beds: Option<i32>,
-    pub baths: Option<f64>,
+    // `real` column (single precision) — must be f32 so SeaORM/sqlx binds a
+    // float4 param on Postgres rather than a float8 (which is rejected).
+    pub baths: Option<f32>,
     pub sqft: Option<i32>,
     /// available | occupied | make_ready | maintenance | down
     pub status: String,
