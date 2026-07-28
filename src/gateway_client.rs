@@ -7,6 +7,13 @@
 //!   * `LINEXUS_LOGGER_URL` (default `http://127.0.0.1:5151`)
 //!   * `LINEXUS_SERVICE_TOKEN` — bearer token presented to both.
 //!
+//! One call goes the other way: task results are forwarded to Daedalus IT's
+//! automation results ingest, so the Hub's TaskRuns complete in real time
+//! instead of waiting out its stale-run sweep:
+//!   * `DAEDALUS_INGEST_URL` — the Hub's API origin (unset = don't forward)
+//!   * `DAEDALUS_INGEST_KEY` — its `AUTOMATION_INGEST_KEY`, sent as
+//!     `X-Daedalus-Automation-Key`.
+//!
 //! Proxies are explicitly disabled: these are internal calls that must not be
 //! routed through an outbound web proxy.
 
@@ -79,5 +86,42 @@ pub async fn ship_log(entry: &Value) -> anyhow::Result<()> {
         .send()
         .await?
         .error_for_status()?;
+    Ok(())
+}
+
+/// Forward a terminal task result to Daedalus IT's automation ingest,
+/// correlated by the Linexus task id. Best-effort by contract: the result is
+/// already recorded in Nexus before this is attempted, and the Hub's stale-run
+/// sweep is the backstop when the Hub is unreachable — so an error here is
+/// log-and-continue, never a failure of the agent's report.
+pub async fn forward_task_result(
+    task_id: &str,
+    status: &str,
+    exit_code: i64,
+    output: &str,
+) -> anyhow::Result<()> {
+    let Some(base) = std::env::var("DAEDALUS_INGEST_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(()); // forwarding not configured — nothing to do
+    };
+    let url = format!(
+        "{}/api/v1/automation/results/task",
+        base.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "linexusTaskId": task_id,
+        "status": status,
+        "exitCode": exit_code,
+        "output": output,
+    });
+    let mut req = client()?.post(&url).json(&body);
+    if let Ok(key) = std::env::var("DAEDALUS_INGEST_KEY") {
+        if !key.is_empty() {
+            req = req.header("X-Daedalus-Automation-Key", key);
+        }
+    }
+    req.send().await?.error_for_status()?;
     Ok(())
 }
