@@ -365,6 +365,12 @@ pub struct TaskResultRequest {
     pub error: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    /// The script's exit code, passed through to Daedalus IT's run history.
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    /// Captured output (tail), likewise passed through.
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// `POST /api/v1/agents/{id}/tasks/{task_id}/result` — record a terminal task
@@ -389,15 +395,37 @@ pub async fn report_result(
         .complete(&ctx.db, final_status, req.error.as_deref())
         .await?;
 
+    let message = req
+        .message
+        .unwrap_or_else(|| format!("task {final_status}"));
     let audit = json!({
         "agent_id": id,
         "task_id": task_id,
         "level": if final_status == "failed" { "error" } else { "info" },
         "source": "agent",
-        "message": req.message.unwrap_or_else(|| format!("task {final_status}")),
+        "message": message,
     });
     if let Err(e) = gateway_client::ship_log(&audit).await {
         tracing::warn!(error = %e, "failed to ship task-result audit log");
+    }
+
+    // Close the loop with the Hub: its TaskRun (correlated by this Linexus
+    // task id) completes now rather than waiting out the stale-run sweep.
+    // Best-effort — the result is already recorded here, and the Hub treats
+    // a duplicate delivery as a no-op, so retrying is always safe.
+    let hub_status = if final_status == "failed" {
+        "failed"
+    } else {
+        "success"
+    };
+    let exit_code = req
+        .exit_code
+        .unwrap_or(if hub_status == "failed" { 1 } else { 0 });
+    let output = req.output.or(req.error).unwrap_or_else(|| message.clone());
+    if let Err(e) =
+        gateway_client::forward_task_result(&task_id, hub_status, exit_code, &output).await
+    {
+        tracing::warn!(error = %e, task_id = %task_id, "failed to forward result to Daedalus IT");
     }
 
     format::json(json!({ "taskId": updated.task_id.to_string(), "status": updated.status }))
