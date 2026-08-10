@@ -27,6 +27,7 @@ mod m20240101_000018_housing_queue;
 mod m20240101_000019_housing_maintenance;
 mod m20240101_000020_housing_documents;
 mod m20240101_000021_agent_facts;
+mod m20240101_000022_agent_environment;
 
 pub struct Migrator;
 
@@ -55,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000019_housing_maintenance::Migration),
             Box::new(m20240101_000020_housing_documents::Migration),
             Box::new(m20240101_000021_agent_facts::Migration),
+            Box::new(m20240101_000022_agent_environment::Migration),
             // inject-above (do not remove this comment)
         ]
     }
