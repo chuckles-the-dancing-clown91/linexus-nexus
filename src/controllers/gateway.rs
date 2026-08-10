@@ -74,6 +74,24 @@ fn agent_json(a: &agents::Model) -> Value {
     })
 }
 
+/// The environment/tracking shape, shared by the read endpoint and the detail
+/// projection. `environment` is never empty on the wire — an agent enrolled
+/// before this column existed reads back as production, which is the same
+/// assumption every other part of the stack makes about an unclassified box.
+fn environment_json(a: &agents::Model) -> Value {
+    let env = if a.environment.trim().is_empty() {
+        agents::DEFAULT_ENVIRONMENT.to_string()
+    } else {
+        a.environment.clone()
+    };
+    json!({
+        "environment": env,
+        "monitored": a.monitored,
+        "note": a.monitor_note.clone().unwrap_or_default(),
+        "updatedAt": a.environment_updated_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+    })
+}
+
 /// The `AgentDetail` shape: identity + state + reported facts.
 fn agent_detail_json(a: &agents::Model) -> Value {
     json!({
@@ -90,6 +108,15 @@ fn agent_detail_json(a: &agents::Model) -> Value {
         "diskGb": a.disk_gb.unwrap_or(0),
         "agentVersion": a.agent_version.clone().unwrap_or_default(),
         "uptimeSeconds": a.uptime_seconds.unwrap_or(0),
+        // Policy, carried alongside the facts so the Hub can see at a glance
+        // whether the two ends actually agree about what this machine is.
+        "environment": if a.environment.trim().is_empty() {
+            agents::DEFAULT_ENVIRONMENT.to_string()
+        } else {
+            a.environment.clone()
+        },
+        "monitored": a.monitored,
+        "monitorNote": a.monitor_note.clone().unwrap_or_default(),
     })
 }
 
@@ -186,6 +213,16 @@ pub async fn create_task(
         target_agents: Some(req.targets.clone()),
     };
     let task = tasks::Model::create(&ctx.db, &created_by, &params).await?;
+
+    // `set_environment` is the one intent that also changes what this service
+    // knows, not just what an agent is asked to do. Applying it here — rather
+    // than only on the dedicated endpoint — means the inventory is right no
+    // matter which door the request came through, and a caller that dispatches
+    // the intent without calling the endpoint cannot leave Nexus believing a
+    // machine is something it is not.
+    if req.intent == "set_environment" {
+        apply_environment_intent(&ctx, &req).await;
+    }
 
     let plan_body = json!({
         "intent": req.intent,
@@ -302,6 +339,135 @@ pub async fn report(
     };
     let updated = agent.report_facts(&ctx.db, &params).await?;
     format::json(agent_detail_json(&updated))
+}
+
+/// Persist a `set_environment` intent's params onto every agent it targets.
+///
+/// Targets are matched by agent id first and hostname second, mirroring what
+/// Daedalus IT sends (it falls back to the hostname for a machine with no
+/// agent id yet). A target that matches nothing is logged and skipped — this
+/// runs alongside task creation and must never fail the dispatch, because the
+/// task itself is already recorded and the agent will still be told.
+async fn apply_environment_intent(ctx: &AppContext, req: &CreateTaskRequest) {
+    let environment = req
+        .params
+        .get("environment")
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| agents::DEFAULT_ENVIRONMENT.to_string());
+    // Anything other than an explicit "false" leaves the machine tracked.
+    // Going quiet has to be asked for, never inferred from a missing field.
+    let monitored = req
+        .params
+        .get("monitored")
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+    let note = req.params.get("note").map(|s| s.trim().to_string());
+
+    for target in &req.targets {
+        let found = match uuid::Uuid::parse_str(target) {
+            Ok(id) => agents::Model::find_by_agent_id(&ctx.db, &id).await.ok(),
+            Err(_) => agents::Model::find_by_hostname(&ctx.db, target).await.ok(),
+        };
+        let Some(agent) = found else {
+            tracing::warn!(target = %target, "set_environment: no such agent, inventory not updated");
+            continue;
+        };
+        let params = agents::SetEnvironmentParams {
+            environment: environment.clone(),
+            monitored,
+            note: note.clone(),
+        };
+        if let Err(e) = agent.set_environment(&ctx.db, &params).await {
+            tracing::warn!(error = %e, target = %target, "set_environment: inventory update failed");
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEnvironmentRequest {
+    pub environment: String,
+    #[serde(default = "default_monitored")]
+    pub monitored: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Absent means tracked. A body that forgets the field must not silently mute
+/// a machine — going quiet has to be something somebody asked for.
+const fn default_monitored() -> bool {
+    true
+}
+
+/// `POST /api/v1/agents/{id}/environment` — record the Hub's decision about
+/// what this machine is and whether it counts.
+///
+/// This is the durable half of the push. The matching `set_environment` intent
+/// tells the *running* agent to apply it now; this makes sure the answer
+/// survives the agent being offline, restarted, or reinstalled, because the
+/// enrolment record is what a fresh agent reads itself out of.
+pub async fn set_environment(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetEnvironmentRequest>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let uuid = parse_uuid(&id)?;
+    let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
+
+    let params = agents::SetEnvironmentParams {
+        environment: req.environment,
+        monitored: req.monitored,
+        note: req.note,
+    };
+    let updated = agent.set_environment(&ctx.db, &params).await?;
+    tracing::info!(
+        agent_id = %updated.agent_id,
+        hostname = %updated.hostname,
+        environment = %updated.environment,
+        monitored = updated.monitored,
+        "agent environment set"
+    );
+
+    // Best-effort audit line, so the decision appears in the journal Daedalus
+    // IT tails rather than only in this table. A logging failure never fails
+    // the write — the inventory is already correct.
+    let audit = json!({
+        "agent_id": updated.agent_id.to_string(),
+        "level": "info",
+        "source": "nexus",
+        "message": format!(
+            "environment set to {} ({})",
+            updated.environment,
+            if updated.monitored { "tracked" } else { "not tracked" }
+        ),
+        "metadata": {
+            "environment": updated.environment,
+            "monitored": updated.monitored,
+            "note": updated.monitor_note,
+        },
+    });
+    if let Err(e) = gateway_client::ship_log(&audit).await {
+        tracing::warn!(error = %e, "failed to ship environment audit log");
+    }
+
+    format::json(environment_json(&updated))
+}
+
+/// `GET /api/v1/agents/{id}/environment` — what the inventory authority
+/// currently believes this machine is. Read by the Hub to confirm the two ends
+/// agree, and by an agent that wants to re-read its own state after a restart.
+pub async fn get_environment(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let uuid = parse_uuid(&id)?;
+    let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
+    format::json(environment_json(&agent))
 }
 
 /// `POST /api/v1/agents/{id}/heartbeat` — liveness signal.
@@ -493,6 +659,10 @@ pub fn routes() -> Routes {
         .add("/agents/enroll", post(enroll))
         .add("/agents/{id}", get(get_agent))
         .add("/agents/{id}/report", post(report))
+        .add(
+            "/agents/{id}/environment",
+            get(get_environment).post(set_environment),
+        )
         .add("/agents/{id}/heartbeat", post(heartbeat))
         .add("/agents/{id}/logs", get(agent_logs).post(ship_agent_logs))
         .add("/agents/{id}/tasks", get(poll_tasks))

@@ -33,6 +33,17 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub agent_version: Option<String>,
     pub uptime_seconds: Option<i64>,
+    // Policy, not facts. Everything above is what the agent found out about
+    // itself; these are what the Hub decided about it and pushed down. They
+    // live here because Nexus is the inventory authority — a reinstalled
+    // agent enrolls and learns what it used to be, instead of coming back as
+    // an anonymous production node that starts paging somebody.
+    #[sea_orm(column_type = "Text")]
+    pub environment: String,
+    pub monitored: bool,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub monitor_note: Option<String>,
+    pub environment_updated_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

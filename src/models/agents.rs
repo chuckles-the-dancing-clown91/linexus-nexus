@@ -12,6 +12,24 @@ pub struct EnrollAgentParams {
     pub capability_manifest: Option<String>,
 }
 
+/// The environment and tracking state the Hub has decided for a machine.
+///
+/// This is not a fact the agent reports — it is policy pushed down to it, and
+/// it is stored here so an agent that is offline (or reinstalled next month)
+/// still learns what it is the moment it enrolls, instead of coming back as an
+/// anonymous production node that immediately starts paging somebody.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetEnvironmentParams {
+    pub environment: String,
+    pub monitored: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The default environment for an agent nobody has classified. Production,
+/// because the safe reading of an unlabelled machine is that it matters.
+pub const DEFAULT_ENVIRONMENT: &str = "production";
+
 /// Facts an agent reports after enrolling (or on any subsequent scan). Every
 /// field is optional so a partial report only touches what it carries.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -43,6 +61,23 @@ impl Model {
         agent.ok_or_else(|| ModelError::EntityNotFound)
     }
 
+    /// Find an agent by hostname.
+    ///
+    /// Daedalus IT targets a machine by its agent id when it has one and falls
+    /// back to the hostname when it doesn't, so both lookups have to exist for
+    /// a targeted intent to reach the right inventory row.
+    pub async fn find_by_hostname(db: &DatabaseConnection, hostname: &str) -> ModelResult<Self> {
+        let agent = agents::Entity::find()
+            .filter(
+                model::query::condition()
+                    .eq(agents::Column::Hostname, hostname)
+                    .build(),
+            )
+            .one(db)
+            .await?;
+        agent.ok_or_else(|| ModelError::EntityNotFound)
+    }
+
     /// Find all agents
     pub async fn find_all(db: &DatabaseConnection) -> ModelResult<Vec<Self>> {
         Ok(agents::Entity::find().all(db).await?)
@@ -58,12 +93,52 @@ impl Model {
             hostgroup: ActiveValue::set(params.hostgroup.clone()),
             enrolled_at: ActiveValue::set(Some(chrono::Local::now().into())),
             last_heartbeat_at: ActiveValue::set(None),
+            // A machine enrolls as production and tracked. Both are set
+            // explicitly rather than left to the column default so the record
+            // returned to the enrolling agent carries the real values — an
+            // agent that reads `monitored: false` out of an unset field would
+            // go quiet the moment it came online.
+            environment: ActiveValue::set(DEFAULT_ENVIRONMENT.to_string()),
+            monitored: ActiveValue::set(true),
+            monitor_note: ActiveValue::set(None),
             ..Default::default()
         }
         .insert(db)
         .await?;
 
         Ok(agent)
+    }
+
+    /// Apply an environment / tracking decision to this agent.
+    ///
+    /// Turning tracking back on clears the note: a stale "decommissioning the
+    /// old mail relay" left on a live machine is worse than no note at all.
+    pub async fn set_environment(
+        self,
+        db: &DatabaseConnection,
+        params: &SetEnvironmentParams,
+    ) -> ModelResult<Self> {
+        let environment = if params.environment.trim().is_empty() {
+            DEFAULT_ENVIRONMENT.to_string()
+        } else {
+            params.environment.trim().to_lowercase()
+        };
+        let note = if params.monitored {
+            None
+        } else {
+            params
+                .note
+                .as_ref()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+        };
+
+        let mut active: agents::ActiveModel = self.into();
+        active.environment = ActiveValue::set(environment);
+        active.monitored = ActiveValue::set(params.monitored);
+        active.monitor_note = ActiveValue::set(note);
+        active.environment_updated_at = ActiveValue::set(Some(chrono::Local::now().into()));
+        Ok(active.update(db).await?)
     }
 
     /// Record a heartbeat
