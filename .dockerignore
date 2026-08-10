@@ -1,0 +1,6 @@
+target/
+*.sqlite
+*.sqlite-*
+.git/
+.backup/
+docs/
