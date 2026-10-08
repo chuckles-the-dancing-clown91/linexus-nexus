@@ -531,16 +531,79 @@ pub struct TaskResultRequest {
     pub error: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
-    /// The script's exit code, passed through to Daedalus IT's run history.
+    /// The overall exit code (0 = every critical step succeeded). Absent means
+    /// 0 for `success` and 1 otherwise.
     #[serde(default)]
     pub exit_code: Option<i64>,
-    /// Captured output (tail), likewise passed through.
+    /// Combined output. Stored capped at [`tasks::OUTPUT_CAP`] bytes (the tail
+    /// is kept behind a truncation marker) and passed through to the Hub.
     #[serde(default)]
     pub output: Option<String>,
+    /// Per-step results, in plan order.
+    #[serde(default)]
+    pub steps: Option<Vec<StepResultRequest>>,
+}
+
+/// One step's outcome in a result body. Every field is optional so a partial
+/// step never rejects the whole result.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepResultRequest {
+    #[serde(default, alias = "stepId")]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    /// `success`, `failed` or `skipped` (the rmm-agent's vocabulary).
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub changed: Option<bool>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl From<StepResultRequest> for tasks::StepResult {
+    fn from(s: StepResultRequest) -> Self {
+        Self {
+            id: s.id.unwrap_or_default(),
+            action: s.action.unwrap_or_default(),
+            status: s.status.unwrap_or_default(),
+            changed: s.changed.unwrap_or(false),
+            output: s.output.unwrap_or_default(),
+            error: s.error.unwrap_or_default(),
+        }
+    }
+}
+
+/// Fold per-step results into one readable block, for a result that carried
+/// steps but no combined `output` (each step's output, or its error, under a
+/// header naming the step).
+fn steps_output(steps: &[tasks::StepResult]) -> String {
+    steps
+        .iter()
+        .filter(|s| !s.output.is_empty() || !s.error.is_empty())
+        .map(|s| {
+            let mut block = format!("==> {} [{}]", s.action, s.status);
+            if !s.output.is_empty() {
+                block.push('\n');
+                block.push_str(&s.output);
+            }
+            if !s.error.is_empty() {
+                block.push_str("\nerror: ");
+                block.push_str(&s.error);
+            }
+            block
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `POST /api/v1/agents/{id}/tasks/{task_id}/result` — record a terminal task
-/// result reported by the agent, and surface it in the operational log.
+/// result reported by the agent (verdict, exit code, capped output and
+/// per-step results, served back by `GET /api/v1/tasks/{id}`), surface it in
+/// the operational log, and forward it to the Hub.
 pub async fn report_result(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -557,13 +620,42 @@ pub async fn report_result(
     } else {
         "failed"
     };
-    let updated = task
-        .complete(&ctx.db, final_status, req.error.as_deref())
-        .await?;
+    let hub_status = if final_status == "failed" {
+        "failed"
+    } else {
+        "success"
+    };
+    let exit_code = req
+        .exit_code
+        .unwrap_or(if hub_status == "failed" { 1 } else { 0 });
+    let steps: Vec<tasks::StepResult> = req
+        .steps
+        .unwrap_or_default()
+        .into_iter()
+        .map(tasks::StepResult::from)
+        .collect();
+    // What the run printed: the agent's combined output when it sent one,
+    // otherwise whatever the steps printed.
+    let run_output = req
+        .output
+        .filter(|o| !o.is_empty())
+        .or_else(|| Some(steps_output(&steps)).filter(|o| !o.is_empty()));
 
     let message = req
         .message
+        .clone()
         .unwrap_or_else(|| format!("task {final_status}"));
+    let params = tasks::RecordResultParams {
+        status: final_status.to_string(),
+        result_status: req.status.clone(),
+        error: req.error.clone(),
+        message: req.message,
+        exit_code,
+        output: run_output,
+        steps,
+    };
+    let updated = task.record_result(&ctx.db, &params).await?;
+
     let audit = json!({
         "agent_id": id,
         "task_id": task_id,
@@ -578,16 +670,15 @@ pub async fn report_result(
     // Close the loop with the Hub: its TaskRun (correlated by this Linexus
     // task id) completes now rather than waiting out the stale-run sweep.
     // Best-effort — the result is already recorded here, and the Hub treats
-    // a duplicate delivery as a no-op, so retrying is always safe.
-    let hub_status = if final_status == "failed" {
-        "failed"
-    } else {
-        "success"
-    };
-    let exit_code = req
-        .exit_code
-        .unwrap_or(if hub_status == "failed" { 1 } else { 0 });
-    let output = req.output.or(req.error).unwrap_or_else(|| message.clone());
+    // a duplicate delivery as a no-op, so retrying is always safe. The output
+    // is the stored (capped) run output when there is one, else the error,
+    // else the one-line summary.
+    let output = updated
+        .output
+        .clone()
+        .filter(|o| !o.is_empty())
+        .or(req.error)
+        .unwrap_or_else(|| message.clone());
     if let Err(e) =
         gateway_client::forward_task_result(&task_id, hub_status, exit_code, &output).await
     {
@@ -595,6 +686,88 @@ pub async fn report_result(
     }
 
     format::json(json!({ "taskId": updated.task_id.to_string(), "status": updated.status }))
+}
+
+/// The `result` block of a task: what the agent reported, or `null` while the
+/// task has not finished. A task finished before results were stored (or by
+/// a path that stores none) gets a result derived from its lifecycle status.
+fn task_result_json(t: &tasks::Model) -> Value {
+    let result_status = match (&t.result_status, t.status.as_str()) {
+        (Some(s), _) => s.clone(),
+        (None, "completed") => "success".to_string(),
+        (None, "failed") => "failed".to_string(),
+        (None, _) => return Value::Null,
+    };
+    let exit_code = t
+        .exit_code
+        .unwrap_or(if result_status == "success" { 0 } else { 1 });
+    let steps: Vec<Value> = t
+        .step_results()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "action": s.action,
+                "status": s.status,
+                "changed": s.changed,
+                "output": s.output,
+                "error": s.error,
+            })
+        })
+        .collect();
+    json!({
+        "status": result_status,
+        "exitCode": exit_code,
+        "message": t.result_message.clone().unwrap_or_default(),
+        "error": t.error_message.clone().unwrap_or_default(),
+        "output": t.output.clone().unwrap_or_default(),
+        "steps": steps,
+    })
+}
+
+/// The `Task` shape served by `GET /api/v1/tasks/{id}`.
+fn task_json(t: &tasks::Model) -> Value {
+    json!({
+        "taskId": t.task_id.to_string(),
+        "intent": t.intent,
+        "status": t.status,
+        "targets": t.targets(),
+        "createdAt": t.created_at.to_rfc3339(),
+        "updatedAt": t.updated_at.to_rfc3339(),
+        "completedAt": t.completed_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        "result": task_result_json(t),
+    })
+}
+
+/// `GET /api/v1/tasks/{id}` — one task's lifecycle and, once the agent has
+/// reported, its result. This is what a caller polls to follow a task it
+/// dispatched to completion.
+///
+/// `status` is the task lifecycle: `accepted` (recorded, the Orchestrator
+/// could not plan it — no agent will pick it up), `planned`, `dispatched` (an
+/// agent has been handed the plan), then `completed` or `failed` once the
+/// agent reports; `pending` only exists for an instant during creation, and
+/// `cancelled` is set by the operator API. An id that names no task — or is
+/// not a UUID — is `404 {"error":"not_found"}`.
+pub async fn get_task(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let not_found = || {
+        format::render()
+            .status(axum::http::StatusCode::NOT_FOUND)
+            .json(json!({ "error": "not_found" }))
+    };
+    let Ok(tid) = uuid::Uuid::parse_str(&id) else {
+        return not_found();
+    };
+    match tasks::Model::find_by_task_id(&ctx.db, &tid).await {
+        Ok(task) => format::json(task_json(&task)),
+        Err(ModelError::EntityNotFound) => not_found(),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -668,4 +841,5 @@ pub fn routes() -> Routes {
         .add("/agents/{id}/tasks", get(poll_tasks))
         .add("/agents/{id}/tasks/{task_id}/result", post(report_result))
         .add("/tasks", post(create_task))
+        .add("/tasks/{id}", get(get_task))
 }

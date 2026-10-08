@@ -48,6 +48,14 @@ compilation: debug
 listening on http://localhost:5150
 ```
 
+## Daedalus IT gateway (`/api/v1`)
+
+The surface the Hub and the rmm-agent use — agent inventory and facts, log
+tails, task dispatch, and following a task to completion with
+`GET /api/v1/tasks/{id}` (lifecycle `status`, plus the agent's result: exit
+code, capped output and per-step results). Bearer-token auth. Routes, task
+statuses and the result body are in [docs/GATEWAY_API.md](docs/GATEWAY_API.md).
+
 ## Full Stack Serving
 
 You can check your [configuration](config/development.yaml) to pick either frontend setup or server-side rendered template, and activate the relevant configuration sections.

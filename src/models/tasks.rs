@@ -1,9 +1,83 @@
 use loco_rs::prelude::*;
+use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::ActiveValue;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use super::_entities::tasks::{self, ActiveModel, Entity, Model};
+
+/// Most bytes of combined output kept per task. Longer output keeps its tail
+/// (where a failing script says why) behind a truncation marker.
+pub const OUTPUT_CAP: usize = 64 * 1024;
+/// Most bytes of output kept per step.
+pub const STEP_OUTPUT_CAP: usize = 16 * 1024;
+/// Most bytes of a step's error kept.
+pub const STEP_ERROR_CAP: usize = 4 * 1024;
+/// Most steps kept per result; a plan is a handful of steps, so this only
+/// bounds a misbehaving reporter.
+pub const MAX_STEPS: usize = 256;
+
+/// Keep at most `max` bytes of `s`. When it is longer, the *tail* is kept and
+/// prefixed with a marker saying how much was dropped; the cut always lands on
+/// a UTF-8 character boundary, so the result may be a few bytes short of `max`.
+#[must_use]
+pub fn cap_output(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let marker_room = 48;
+    let keep = max.saturating_sub(marker_room);
+    let mut start = s.len() - keep;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[... truncated {start} bytes ...]\n{}", &s[start..])
+}
+
+/// One step's outcome as stored and served: `status` is the agent's verdict
+/// for the step (the rmm-agent sends `success`, `failed` or `skipped`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepResult {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub error: String,
+}
+
+impl StepResult {
+    /// Apply the per-step size caps.
+    #[must_use]
+    pub fn capped(mut self) -> Self {
+        self.output = cap_output(&self.output, STEP_OUTPUT_CAP);
+        self.error = cap_output(&self.error, STEP_ERROR_CAP);
+        self
+    }
+}
+
+/// A terminal result to record on a task.
+#[derive(Debug, Clone, Default)]
+pub struct RecordResultParams {
+    /// Lifecycle status to move to: `completed` or `failed`.
+    pub status: String,
+    /// The agent's verdict as sent (`success` / `failed`).
+    pub result_status: String,
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub exit_code: i64,
+    /// Combined output; capped to [`OUTPUT_CAP`] on write.
+    pub output: Option<String>,
+    /// Per-step results; capped to [`MAX_STEPS`] and the per-step limits.
+    pub steps: Vec<StepResult>,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTaskParams {
@@ -62,6 +136,7 @@ impl Model {
     pub async fn update_status(self, db: &DatabaseConnection, status: &str) -> ModelResult<Self> {
         let mut active: tasks::ActiveModel = self.into();
         active.status = ActiveValue::set(status.to_string());
+        active.updated_at = ActiveValue::set(chrono::Local::now().into());
         if status == "completed" || status == "failed" {
             active.completed_at = ActiveValue::set(Some(chrono::Local::now().into()));
         }
@@ -78,6 +153,7 @@ impl Model {
         let mut active: tasks::ActiveModel = self.into();
         active.plan = ActiveValue::set(Some(plan_json.to_string()));
         active.status = ActiveValue::set(status.to_string());
+        active.updated_at = ActiveValue::set(chrono::Local::now().into());
         Ok(active.update(db).await?)
     }
 
@@ -106,6 +182,7 @@ impl Model {
         }
         let mut active: tasks::ActiveModel = self.into();
         active.status = ActiveValue::set("dispatched".to_string());
+        active.updated_at = ActiveValue::set(chrono::Local::now().into());
         Ok(active.update(db).await?)
     }
 
@@ -118,12 +195,73 @@ impl Model {
         error: Option<&str>,
     ) -> ModelResult<Self> {
         let mut active: tasks::ActiveModel = self.into();
+        let now: DateTimeWithTimeZone = chrono::Local::now().into();
         active.status = ActiveValue::set(status.to_string());
-        active.completed_at = ActiveValue::set(Some(chrono::Local::now().into()));
+        active.completed_at = ActiveValue::set(Some(now));
+        active.updated_at = ActiveValue::set(now);
         if let Some(e) = error {
             active.error_message = ActiveValue::set(Some(e.to_string()));
         }
         Ok(active.update(db).await?)
+    }
+
+    /// Record the agent's full result: the lifecycle status (as [`complete`]
+    /// does) plus its verdict, exit code, capped output and per-step results,
+    /// so the task can be read back with `GET /api/v1/tasks/{id}`. A second
+    /// report for the same task overwrites the first.
+    ///
+    /// [`complete`]: Self::complete
+    pub async fn record_result(
+        self,
+        db: &DatabaseConnection,
+        params: &RecordResultParams,
+    ) -> ModelResult<Self> {
+        let steps: Vec<StepResult> = params
+            .steps
+            .iter()
+            .take(MAX_STEPS)
+            .cloned()
+            .map(StepResult::capped)
+            .collect();
+        let steps_json = if params.steps.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&steps).unwrap_or_else(|_| "[]".to_string()))
+        };
+
+        let mut active: tasks::ActiveModel = self.into();
+        let now: DateTimeWithTimeZone = chrono::Local::now().into();
+        active.status = ActiveValue::set(params.status.clone());
+        active.completed_at = ActiveValue::set(Some(now));
+        active.updated_at = ActiveValue::set(now);
+        if let Some(e) = &params.error {
+            active.error_message = ActiveValue::set(Some(e.clone()));
+        }
+        active.result_status = ActiveValue::set(Some(params.result_status.clone()));
+        active.result_message = ActiveValue::set(params.message.clone());
+        active.exit_code = ActiveValue::set(Some(params.exit_code));
+        active.output =
+            ActiveValue::set(params.output.as_deref().map(|o| cap_output(o, OUTPUT_CAP)));
+        active.steps = ActiveValue::set(steps_json);
+        Ok(active.update(db).await?)
+    }
+
+    /// The task's targets (agent ids), decoded from the stored JSON array.
+    #[must_use]
+    pub fn targets(&self) -> Vec<String> {
+        self.target_agents
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// The stored per-step results, decoded (empty when none were reported).
+    #[must_use]
+    pub fn step_results(&self) -> Vec<StepResult> {
+        self.steps
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<StepResult>>(s).ok())
+            .unwrap_or_default()
     }
 }
 
