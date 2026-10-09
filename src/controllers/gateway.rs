@@ -20,9 +20,11 @@ use loco_rs::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::controllers::api::{ApiError, ApiJson, ApiResult};
+use crate::dispatch::{self, DispatchRequest};
 use crate::gateway_client;
-use crate::middleware::system_token;
-use crate::models::{agents, tasks};
+use crate::middleware::system_token::{self, Caller};
+use crate::models::{agents, enrollment_tokens, tasks};
 
 // ---------------------------------------------------------------------------
 // Projection to the Daedalus IT contract
@@ -46,7 +48,7 @@ fn last_report_at(a: &agents::Model) -> String {
 /// Derive the `healthy | drift | offline` state Daedalus IT expects. An agent
 /// that reported within the last 10 minutes is healthy; a stale or never-seen
 /// agent is offline; an explicitly drifted agent is surfaced as such.
-fn agent_state(a: &agents::Model) -> String {
+pub fn agent_state(a: &agents::Model) -> String {
     if a.status == "drift" {
         return "drift".to_string();
     }
@@ -117,6 +119,14 @@ fn agent_detail_json(a: &agents::Model) -> Value {
         },
         "monitored": a.monitored,
         "monitorNote": a.monitor_note.clone().unwrap_or_default(),
+        // Richer facts (§2). Absent lists are `[]`, an absent DNS server and
+        // a never-reported `factsAt` are `null`.
+        "machineId": a.machine_id.clone().unwrap_or_default(),
+        "publicIp": a.public_ip.clone().unwrap_or_default(),
+        "interfaces": agents::json_column(a.interfaces.as_deref(), json!([])),
+        "listening": agents::json_column(a.listening.as_deref(), json!([])),
+        "dnsServer": agents::json_column(a.dns_server.as_deref(), Value::Null),
+        "factsAt": a.facts_at.map_or(Value::Null, |d| json!(d.to_rfc3339())),
     })
 }
 
@@ -142,6 +152,45 @@ pub async fn get_agent(
     let uuid = parse_uuid(&id)?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     format::json(agent_detail_json(&agent))
+}
+
+/// `GET /api/v1/agents/{id}/services` — the services in the last report.
+pub async fn agent_services(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let agent = find_agent(&ctx, &id).await?;
+    Ok(axum::Json(json!({
+        "services": agents::json_column(agent.services.as_deref(), json!([])),
+    }))
+    .into_response())
+}
+
+/// `GET /api/v1/agents/{id}/packages` — the packages in the last report.
+pub async fn agent_packages(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let agent = find_agent(&ctx, &id).await?;
+    Ok(axum::Json(json!({
+        "packages": agents::json_column(agent.packages.as_deref(), json!([])),
+    }))
+    .into_response())
+}
+
+/// The agent named by a path id, or `404 not_found`.
+async fn find_agent(ctx: &AppContext, id: &str) -> ApiResult<agents::Model> {
+    let uuid = uuid::Uuid::parse_str(id).map_err(|_| ApiError::not_found("no such agent"))?;
+    agents::Model::find_by_agent_id(&ctx.db, &uuid)
+        .await
+        .map_err(|e| match e {
+            ModelError::EntityNotFound => ApiError::not_found("no such agent"),
+            other => other.into(),
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,7 +244,9 @@ pub struct CreateTaskRequest {
 
 /// `POST /api/v1/tasks` — record a task, have the Orchestrator plan it, and
 /// return `{taskId, status}`. If the Orchestrator is unreachable the task is
-/// still recorded (status `accepted`) so nothing is silently lost.
+/// still recorded (status `accepted`) and re-planned later (see
+/// [`crate::dispatch`]). A `hostgroup:<name>` target expands to every agent of
+/// that hostgroup now.
 pub async fn create_task(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -207,65 +258,38 @@ pub async fn create_task(
     } else {
         req.requester_id.clone()
     };
-
-    let params = tasks::CreateTaskParams {
-        intent: req.intent.clone(),
-        target_agents: Some(req.targets.clone()),
-    };
-    let task = tasks::Model::create(&ctx.db, &created_by, &params).await?;
-
-    // `set_environment` is the one intent that also changes what this service
-    // knows, not just what an agent is asked to do. Applying it here — rather
-    // than only on the dedicated endpoint — means the inventory is right no
-    // matter which door the request came through, and a caller that dispatches
-    // the intent without calling the endpoint cannot leave Nexus believing a
-    // machine is something it is not.
-    if req.intent == "set_environment" {
-        apply_environment_intent(&ctx, &req).await;
-    }
-
-    let plan_body = json!({
-        "intent": req.intent,
-        "targets": req.targets,
-        "requester_id": created_by,
-        "auto_rollback": req.auto_rollback,
-        "params": req.params,
-        "task_id": task.task_id.to_string(),
-    });
-
-    let task = match gateway_client::plan_task(&plan_body).await {
-        Ok(plan) => {
-            // Store just the TransactionPlan (the orchestrator wraps it in a
-            // PlanResponse envelope) so the agent poll can hand it over directly.
-            let plan_obj = plan.get("plan").cloned().unwrap_or(plan);
-            let plan_str = serde_json::to_string(&plan_obj).unwrap_or_default();
-            task.set_plan(&ctx.db, &plan_str, "planned").await?
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, task_id = %task.task_id, "orchestrator planning failed; task recorded unplanned");
-            task.update_status(&ctx.db, "accepted").await?
-        }
-    };
-
-    // Best-effort: surface the task in the operational log so it appears when
-    // Daedalus IT tails the journal. A logging failure never fails the request.
-    let audit = json!({
-        "task_id": task.task_id.to_string(),
-        "level": "info",
-        "source": "nexus",
-        "message": format!("task planned: {}", req.intent),
-        "metadata": {
-            "intent": req.intent,
-            "targets": req.targets,
-            "requester": created_by,
-            "status": task.status,
+    let task = dispatch::dispatch(
+        &ctx,
+        &DispatchRequest {
+            intent: req.intent,
+            targets: req.targets,
+            requester: created_by,
+            auto_rollback: req.auto_rollback,
+            params: req.params,
         },
-    });
-    if let Err(e) = gateway_client::ship_log(&audit).await {
-        tracing::warn!(error = %e, "failed to ship task audit log");
-    }
-
+    )
+    .await?;
     format::json(json!({ "taskId": task.task_id.to_string(), "status": task.status }))
+}
+
+/// `POST /api/v1/tasks/{id}/cancel` — cancel a task that has not finished.
+/// A cancelled task is never handed to an agent. `409` when it is already
+/// terminal.
+pub async fn cancel_task(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    system_token::authenticate_bearer(&ctx, &headers).await?;
+    let tid = uuid::Uuid::parse_str(&id).map_err(|_| ApiError::not_found("no such task"))?;
+    match dispatch::cancel(&ctx, &tid).await {
+        Ok(true) => Ok(
+            axum::Json(json!({ "taskId": tid.to_string(), "status": "cancelled" })).into_response(),
+        ),
+        Ok(false) => Err(ApiError::conflict("the task has already finished")),
+        Err(ModelError::EntityNotFound) => Err(ApiError::not_found("no such task")),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,26 +300,137 @@ pub async fn create_task(
 #[serde(rename_all = "camelCase")]
 pub struct EnrollRequest {
     pub hostname: String,
+    #[serde(default)]
     pub hostgroup: Option<String>,
+    #[serde(default)]
     pub capability_manifest: Option<String>,
+    /// `/etc/machine-id`: re-adopts an existing agent with the same one.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// An `nxe_` enrollment token; authenticates the request without a bearer.
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
 }
 
-/// `POST /api/v1/agents/enroll` — register a machine, returning its full record
-/// (the agent persists the assigned `id` and uses it for report/heartbeat).
+fn clean_field(v: Option<&str>, field: &str, max: usize) -> ApiResult<Option<String>> {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) if s.len() > max || s.chars().any(char::is_control) => Err(ApiError::invalid(
+            format!("{field}: at most {max} printable characters"),
+        )),
+        Some(s) => Ok(Some(s.to_string())),
+    }
+}
+
+/// `POST /api/v1/agents/enroll` — register a machine and give it its own
+/// credential.
+///
+/// Authenticated **either** by a system key in the bearer (the legacy path)
+/// **or** by an `enrollmentToken` in the body (no bearer needed). A token's
+/// hostgroup and environment win over the body. A `machineId` that is
+/// already known re-adopts that agent (same agent id, credential rotated) —
+/// except, on the token path, when that agent belongs to another hostgroup
+/// (`409`), so a client's token cannot take over another client's machine.
+/// Answers `201` with the agent record plus `agentToken` (`nxa_…`, shown
+/// once), which the agent presents on every later call.
 pub async fn enroll(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
-    Json(req): Json<EnrollRequest>,
-) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
-    let params = agents::EnrollAgentParams {
-        hostname: req.hostname,
-        hostgroup: req.hostgroup,
-        capability_manifest: req.capability_manifest,
+    ApiJson(req): ApiJson<EnrollRequest>,
+) -> ApiResult<Response> {
+    let hostname = clean_field(Some(&req.hostname), "hostname", 253)?
+        .ok_or_else(|| ApiError::invalid("hostname: required"))?;
+    let hostgroup = clean_field(req.hostgroup.as_deref(), "hostgroup", 128)?;
+    let machine_id = clean_field(req.machine_id.as_deref(), "machineId", 128)?;
+    if machine_id
+        .as_deref()
+        .is_some_and(|m| !m.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    {
+        return Err(ApiError::invalid(
+            "machineId: letters, digits and dashes only",
+        ));
+    }
+    let token = clean_field(req.enrollment_token.as_deref(), "enrollmentToken", 128)?;
+    let existing = match &machine_id {
+        Some(m) => agents::Model::find_by_machine_id(&ctx.db, m).await?,
+        None => None,
     };
-    let agent = agents::Model::enroll(&ctx.db, &params).await?;
-    tracing::info!(agent_id = %agent.agent_id, hostname = %agent.hostname, "agent enrolled");
-    format::json(agent_detail_json(&agent))
+
+    let mut params = agents::EnrollAgentParams {
+        hostname,
+        hostgroup,
+        capability_manifest: req.capability_manifest,
+        machine_id,
+        ..Default::default()
+    };
+    let token_row = if let Some(plaintext) = token {
+        let refused = |r: enrollment_tokens::Refusal| {
+            ApiError::unauthorized(match r {
+                enrollment_tokens::Refusal::Unknown => "unknown enrollment token",
+                enrollment_tokens::Refusal::Expired => "enrollment token expired",
+                enrollment_tokens::Refusal::Revoked => "enrollment token revoked",
+                enrollment_tokens::Refusal::UsedUp => "enrollment token used up",
+            })
+        };
+        let peek = enrollment_tokens::Model::peek(&ctx.db, &plaintext)
+            .await?
+            .map_err(refused)?;
+        if let Some(a) = &existing {
+            let theirs = a.hostgroup.as_deref().unwrap_or_default();
+            if !theirs.is_empty() && theirs != peek.hostgroup {
+                return Err(ApiError::conflict(
+                    "this machine is enrolled in another hostgroup; re-enroll it with a system key or retire the old agent",
+                ));
+            }
+        }
+        let row = enrollment_tokens::Model::consume(&ctx.db, &plaintext)
+            .await?
+            .map_err(refused)?;
+        params.hostgroup = Some(row.hostgroup.clone());
+        params.environment = Some(row.environment.clone());
+        params.enrollment_token_id = Some(row.token_id);
+        params.metadata = Some(row.metadata_value());
+        Some(row)
+    } else {
+        system_token::authenticate_bearer(&ctx, &headers).await?;
+        None
+    };
+
+    let readopted = existing.is_some();
+    let agent = match existing {
+        Some(a) => a.readopt(&ctx.db, &params).await?,
+        None => agents::Model::enroll(&ctx.db, &params).await?,
+    };
+    let (agent, agent_token) = agent.rotate_credential(&ctx.db).await?;
+    if let Some(row) = token_row.clone() {
+        row.add_agent(&ctx.db, &agent.agent_id).await?;
+    }
+    tracing::info!(
+        agent_id = %agent.agent_id,
+        hostname = %agent.hostname,
+        readopted,
+        via_token = token_row.is_some(),
+        "agent enrolled"
+    );
+
+    let mut body = agent_detail_json(&agent);
+    if let Value::Object(map) = &mut body {
+        map.insert("agentId".into(), json!(agent.agent_id.to_string()));
+        map.insert("agentToken".into(), json!(agent_token));
+        map.insert(
+            "enrollmentTokenId".into(),
+            json!(token_row
+                .as_ref()
+                .map(|t| t.token_id.to_string())
+                .unwrap_or_default()),
+        );
+        map.insert(
+            "metadata".into(),
+            agents::json_column(agent.metadata.as_deref(), json!({})),
+        );
+        map.insert("readopted".into(), json!(readopted));
+    }
+    Ok((axum::http::StatusCode::CREATED, axum::Json(body)).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +447,27 @@ pub struct ReportRequest {
     pub agent_version: Option<String>,
     pub uptime_seconds: Option<i64>,
     pub capability_manifest: Option<String>,
+    // Richer facts (§2), all optional.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub public_ip: Option<String>,
+    #[serde(default)]
+    pub interfaces: Option<Value>,
+    #[serde(default)]
+    pub listening: Option<Value>,
+    #[serde(default)]
+    pub services: Option<Value>,
+    #[serde(default)]
+    pub packages: Option<Value>,
+    #[serde(default)]
+    pub dns_server: Option<Value>,
+}
+
+/// Keep a reported list only when it is a JSON array (anything else is
+/// ignored rather than stored and served back as garbage).
+fn array_only(v: Option<Value>) -> Option<Value> {
+    v.filter(Value::is_array)
 }
 
 /// `POST /api/v1/agents/{id}/report` — apply a facts report (also a heartbeat).
@@ -321,8 +477,8 @@ pub async fn report(
     Path(id): Path<String>,
     Json(req): Json<ReportRequest>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
     let uuid = parse_uuid(&id)?;
+    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     let params = agents::ReportFactsParams {
         hostname: req.hostname,
@@ -336,52 +492,21 @@ pub async fn report(
         agent_version: req.agent_version,
         uptime_seconds: req.uptime_seconds,
         capability_manifest: req.capability_manifest,
+        machine_id: req
+            .machine_id
+            .filter(|m| m.len() <= 128 && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
+        public_ip: req
+            .public_ip
+            .filter(|ip| ip.trim().parse::<std::net::IpAddr>().is_ok())
+            .map(|ip| ip.trim().to_string()),
+        interfaces: array_only(req.interfaces),
+        listening: array_only(req.listening),
+        services: array_only(req.services),
+        packages: array_only(req.packages),
+        dns_server: req.dns_server.filter(Value::is_object),
     };
     let updated = agent.report_facts(&ctx.db, &params).await?;
     format::json(agent_detail_json(&updated))
-}
-
-/// Persist a `set_environment` intent's params onto every agent it targets.
-///
-/// Targets are matched by agent id first and hostname second, mirroring what
-/// Daedalus IT sends (it falls back to the hostname for a machine with no
-/// agent id yet). A target that matches nothing is logged and skipped — this
-/// runs alongside task creation and must never fail the dispatch, because the
-/// task itself is already recorded and the agent will still be told.
-async fn apply_environment_intent(ctx: &AppContext, req: &CreateTaskRequest) {
-    let environment = req
-        .params
-        .get("environment")
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| agents::DEFAULT_ENVIRONMENT.to_string());
-    // Anything other than an explicit "false" leaves the machine tracked.
-    // Going quiet has to be asked for, never inferred from a missing field.
-    let monitored = req
-        .params
-        .get("monitored")
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "no"))
-        .unwrap_or(true);
-    let note = req.params.get("note").map(|s| s.trim().to_string());
-
-    for target in &req.targets {
-        let found = match uuid::Uuid::parse_str(target) {
-            Ok(id) => agents::Model::find_by_agent_id(&ctx.db, &id).await.ok(),
-            Err(_) => agents::Model::find_by_hostname(&ctx.db, target).await.ok(),
-        };
-        let Some(agent) = found else {
-            tracing::warn!(target = %target, "set_environment: no such agent, inventory not updated");
-            continue;
-        };
-        let params = agents::SetEnvironmentParams {
-            environment: environment.clone(),
-            monitored,
-            note: note.clone(),
-        };
-        if let Err(e) = agent.set_environment(&ctx.db, &params).await {
-            tracing::warn!(error = %e, target = %target, "set_environment: inventory update failed");
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,8 +589,8 @@ pub async fn get_environment(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
     let uuid = parse_uuid(&id)?;
+    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     format::json(environment_json(&agent))
 }
@@ -476,8 +601,8 @@ pub async fn heartbeat(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
     let uuid = parse_uuid(&id)?;
+    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     let updated = agent.heartbeat(&ctx.db).await?;
     format::json(agent_json(&updated))
@@ -490,14 +615,19 @@ pub async fn heartbeat(
 
 /// `GET /api/v1/agents/{id}/tasks` — planned/dispatched tasks targeting this
 /// agent, each with its TransactionPlan. Handing a plan over transitions the
-/// task from `planned` to `dispatched`.
+/// task from `planned` to `dispatched`. Tasks for this agent that are still
+/// `accepted` (the Orchestrator was unreachable) are re-planned first, so the
+/// agent gets them on this poll once the Orchestrator is back.
 pub async fn poll_tasks(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
     let uuid = parse_uuid(&id)?;
+    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    if let Err(e) = dispatch::replan_for_agent(&ctx, &uuid.to_string()).await {
+        tracing::warn!(error = %e, "re-planning accepted tasks on poll failed");
+    }
     let pending = tasks::Model::find_pending_for_agent(&ctx.db, &uuid.to_string()).await?;
 
     let mut out = Vec::with_capacity(pending.len());
@@ -610,11 +740,15 @@ pub async fn report_result(
     Path((id, task_id)): Path<(String, String)>,
     Json(req): Json<TaskResultRequest>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
-    parse_uuid(&id)?;
+    let agent_uuid = parse_uuid(&id)?;
+    let caller = system_token::authorize_agent(&ctx, &headers, &agent_uuid).await?;
     let tid = parse_uuid(&task_id)?;
 
     let task = tasks::Model::find_by_task_id(&ctx.db, &tid).await?;
+    // An agent reports only on its own tasks.
+    if matches!(caller, Caller::Agent(_)) && !task.targets_agent(&agent_uuid.to_string()) {
+        return Err(loco_rs::Error::NotFound);
+    }
     let final_status = if req.status == "success" {
         "completed"
     } else {
@@ -800,8 +934,8 @@ pub async fn ship_agent_logs(
     Path(id): Path<String>,
     Json(body): Json<ShipLogBody>,
 ) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
     let uuid = parse_uuid(&id)?;
+    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
 
     let entries = match body {
         ShipLogBody::One(e) => vec![e],
@@ -831,6 +965,8 @@ pub fn routes() -> Routes {
         .add("/agents", get(list_agents))
         .add("/agents/enroll", post(enroll))
         .add("/agents/{id}", get(get_agent))
+        .add("/agents/{id}/services", get(agent_services))
+        .add("/agents/{id}/packages", get(agent_packages))
         .add("/agents/{id}/report", post(report))
         .add(
             "/agents/{id}/environment",
@@ -842,4 +978,5 @@ pub fn routes() -> Routes {
         .add("/agents/{id}/tasks/{task_id}/result", post(report_result))
         .add("/tasks", post(create_task))
         .add("/tasks/{id}", get(get_task))
+        .add("/tasks/{id}/cancel", post(cancel_task))
 }

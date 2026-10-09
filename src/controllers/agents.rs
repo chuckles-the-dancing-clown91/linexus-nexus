@@ -72,6 +72,7 @@ pub async fn enroll(
         hostname: req.hostname,
         hostgroup: None,
         capability_manifest: req.capability_manifest,
+        ..Default::default()
     };
 
     let agent = agents::Model::enroll(&ctx.db, &params).await?;

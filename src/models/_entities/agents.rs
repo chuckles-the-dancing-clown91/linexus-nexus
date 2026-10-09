@@ -44,6 +44,29 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub monitor_note: Option<String>,
     pub environment_updated_at: Option<DateTimeWithTimeZone>,
+    // Identity. `machine_id` re-adopts a re-enrolling machine; the agent's own
+    // `nxa_` credential is kept only as its SHA-256.
+    pub machine_id: Option<String>,
+    pub credential_hash: Option<String>,
+    pub enrollment_token_id: Option<Uuid>,
+    /// The Hub's ids carried on the enrollment token (JSON object).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub metadata: Option<String>,
+    // Richer facts (JSON text), stamped by `facts_at`.
+    pub public_ip: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub interfaces: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub listening: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub services: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub packages: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub dns_server: Option<String>,
+    pub facts_at: Option<DateTimeWithTimeZone>,
+    /// The last `install_dns_server` task dispatched to this agent.
+    pub dns_install_task_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -114,7 +114,7 @@ impl Hooks for App {
     }
 
     async fn initializers(_ctx: &AppContext) -> Result<Vec<Box<dyn Initializer>>> {
-        Ok(vec![])
+        Ok(vec![Box::new(crate::initializers::task_sweep::TaskSweep)])
     }
 
     fn routes(_ctx: &AppContext) -> AppRoutes {
@@ -126,6 +126,12 @@ impl Hooks for App {
             .add_route(controllers::nexus::routes())
             .add_route(controllers::housing::routes())
             .add_route(controllers::gateway::routes())
+            .add_route(controllers::enrollment::routes())
+            .add_route(controllers::providers::routes())
+            .add_route(controllers::dns::routes())
+            .add_route(controllers::domains::routes())
+            .add_route(controllers::cloud::routes())
+            .add_route(controllers::install::routes())
     }
     async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
         queue.register(DownloadWorker::build(ctx)).await?;

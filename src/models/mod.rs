@@ -1,6 +1,8 @@
 pub mod _entities;
 pub mod agents;
 pub mod contributions;
+pub mod dns_zones;
+pub mod enrollment_tokens;
 pub mod housing_council_reviews;
 pub mod housing_documents;
 pub mod housing_maintenance;
@@ -11,6 +13,8 @@ pub mod housing_units;
 pub mod nodes;
 pub mod payments;
 pub mod plans;
+pub mod provider_credentials;
+pub mod provider_operations;
 pub mod roles;
 pub mod system_tokens;
 pub mod tasks;

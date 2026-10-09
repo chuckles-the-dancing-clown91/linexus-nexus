@@ -14,7 +14,7 @@
 use axum::http::HeaderMap;
 use loco_rs::prelude::*;
 
-use crate::models::system_tokens;
+use crate::models::{agents, enrollment_tokens, system_tokens};
 
 /// Header carrying the service token.
 pub const HEADER: &str = "x-nexus-system-token";
@@ -99,6 +99,14 @@ pub async fn validate_token(ctx: &AppContext, token: &str) -> Result<SystemConte
     if token.is_empty() {
         return Err(loco_rs::Error::Unauthorized("empty token".to_string()));
     }
+    // An agent's own credential (or an enrollment token) is never a system
+    // key, whatever the tables say: operator routes refuse it outright.
+    if token.starts_with(agents::CREDENTIAL_PREFIX) || token.starts_with(enrollment_tokens::PREFIX)
+    {
+        return Err(loco_rs::Error::Unauthorized(
+            "agent credentials cannot call operator routes".to_string(),
+        ));
+    }
 
     if constant_time_eq(token, &root_token()) {
         return Ok(SystemContext {
@@ -127,7 +135,16 @@ pub async fn validate_token(ctx: &AppContext, token: &str) -> Result<SystemConte
 /// used by the Demiurge publisher integration. Both resolve to the same token
 /// set (root token or a `system_tokens` row).
 pub async fn authenticate_bearer(ctx: &AppContext, headers: &HeaderMap) -> Result<SystemContext> {
-    let token = headers
+    let token = bearer_token(headers)
+        .ok_or_else(|| loco_rs::Error::Unauthorized("missing bearer token".to_string()))?;
+
+    validate_token(ctx, token).await
+}
+
+/// The bearer token of a request, if any.
+#[must_use]
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
@@ -136,9 +153,50 @@ pub async fn authenticate_bearer(ctx: &AppContext, headers: &HeaderMap) -> Resul
         })
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| loco_rs::Error::Unauthorized("missing bearer token".to_string()))?;
+}
 
-    validate_token(ctx, token).await
+/// Who is calling an agent route: a system key, or one agent by its own
+/// `nxa_` credential.
+#[derive(Debug, Clone)]
+pub enum Caller {
+    System(SystemContext),
+    Agent(uuid::Uuid),
+}
+
+impl Caller {
+    /// A short name for audit records.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match self {
+            Self::System(s) => format!("service:{}", s.service),
+            Self::Agent(id) => format!("agent:{id}"),
+        }
+    }
+}
+
+/// Authenticate a caller of an agent route that concerns `agent_id`: a
+/// system key, or the agent's own credential **for its own id only**.
+/// Another agent's credential is `401`.
+pub async fn authorize_agent(
+    ctx: &AppContext,
+    headers: &HeaderMap,
+    agent_id: &uuid::Uuid,
+) -> Result<Caller> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| loco_rs::Error::Unauthorized("missing bearer token".to_string()))?;
+    if token.starts_with(agents::CREDENTIAL_PREFIX) {
+        let hash = system_tokens::hash_token(token);
+        let agent = agents::Model::find_by_credential_hash(&ctx.db, &hash).await?;
+        return match agent {
+            Some(a) if constant_time_eq(&a.agent_id.to_string(), &agent_id.to_string()) => {
+                Ok(Caller::Agent(a.agent_id))
+            }
+            _ => Err(loco_rs::Error::Unauthorized(
+                "agent credential not valid for this agent".to_string(),
+            )),
+        };
+    }
+    Ok(Caller::System(validate_token(ctx, token).await?))
 }
 
 /// Authenticate and require a specific scope. Use this to guard service routes:

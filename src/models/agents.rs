@@ -5,12 +5,26 @@ use uuid::Uuid;
 
 pub use super::_entities::agents::{self, ActiveModel, Entity, Model};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct EnrollAgentParams {
     pub hostname: String,
     pub hostgroup: Option<String>,
     pub capability_manifest: Option<String>,
+    /// `/etc/machine-id`; re-adopts an existing agent with the same one.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// The environment to enroll into (an enrollment token's wins).
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub enrollment_token_id: Option<Uuid>,
+    /// The Hub's ids carried on the enrollment token.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
+
+/// Plaintext prefix of an agent's own credential.
+pub const CREDENTIAL_PREFIX: &str = "nxa_";
 
 /// The environment and tracking state the Hub has decided for a machine.
 ///
@@ -45,9 +59,158 @@ pub struct ReportFactsParams {
     pub agent_version: Option<String>,
     pub uptime_seconds: Option<i64>,
     pub capability_manifest: Option<String>,
+    // Richer facts; JSON values stored as text.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub public_ip: Option<String>,
+    #[serde(default)]
+    pub interfaces: Option<serde_json::Value>,
+    #[serde(default)]
+    pub listening: Option<serde_json::Value>,
+    #[serde(default)]
+    pub services: Option<serde_json::Value>,
+    #[serde(default)]
+    pub packages: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dns_server: Option<serde_json::Value>,
+}
+
+/// Decode a stored JSON text column, `default` when absent or unreadable.
+#[must_use]
+pub fn json_column(raw: Option<&str>, default: serde_json::Value) -> serde_json::Value {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(default)
 }
 
 impl Model {
+    /// The oldest agent that reported `machine_id`.
+    pub async fn find_by_machine_id(
+        db: &DatabaseConnection,
+        machine_id: &str,
+    ) -> ModelResult<Option<Self>> {
+        use sea_orm::QueryOrder;
+        Ok(agents::Entity::find()
+            .filter(agents::Column::MachineId.eq(machine_id))
+            .order_by_asc(agents::Column::Id)
+            .one(db)
+            .await?)
+    }
+
+    /// The agent holding the credential whose SHA-256 is `hash`.
+    pub async fn find_by_credential_hash(
+        db: &DatabaseConnection,
+        hash: &str,
+    ) -> ModelResult<Option<Self>> {
+        Ok(agents::Entity::find()
+            .filter(agents::Column::CredentialHash.eq(hash))
+            .one(db)
+            .await?)
+    }
+
+    /// Every agent in `hostgroup`.
+    pub async fn find_by_hostgroup(
+        db: &DatabaseConnection,
+        hostgroup: &str,
+    ) -> ModelResult<Vec<Self>> {
+        use sea_orm::QueryOrder;
+        Ok(agents::Entity::find()
+            .filter(agents::Column::Hostgroup.eq(hostgroup))
+            .order_by_asc(agents::Column::Id)
+            .all(db)
+            .await?)
+    }
+
+    /// Issue a fresh `nxa_` credential, replacing any previous one. Returns
+    /// the updated row and the one-time plaintext.
+    pub async fn rotate_credential(self, db: &DatabaseConnection) -> ModelResult<(Self, String)> {
+        let plaintext = format!(
+            "{CREDENTIAL_PREFIX}{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        let mut active: agents::ActiveModel = self.into();
+        active.credential_hash =
+            ActiveValue::set(Some(crate::models::system_tokens::hash_token(&plaintext)));
+        Ok((active.update(db).await?, plaintext))
+    }
+
+    /// Re-adopt this agent for a machine enrolling again: keep the agent id,
+    /// take the new identity and placement (facts are kept until the next
+    /// report).
+    pub async fn readopt(
+        self,
+        db: &DatabaseConnection,
+        params: &EnrollAgentParams,
+    ) -> ModelResult<Self> {
+        let mut active: agents::ActiveModel = self.into();
+        active.hostname = ActiveValue::set(params.hostname.clone());
+        if params.hostgroup.is_some() {
+            active.hostgroup = ActiveValue::set(params.hostgroup.clone());
+        }
+        if let Some(env) = params.environment.as_ref().filter(|e| !e.trim().is_empty()) {
+            active.environment = ActiveValue::set(env.trim().to_lowercase());
+        }
+        if params.capability_manifest.is_some() {
+            active.capability_manifest = ActiveValue::set(params.capability_manifest.clone());
+        }
+        if params.enrollment_token_id.is_some() {
+            active.enrollment_token_id = ActiveValue::set(params.enrollment_token_id);
+        }
+        if let Some(m) = &params.metadata {
+            active.metadata = ActiveValue::set(Some(m.to_string()));
+        }
+        active.machine_id = ActiveValue::set(params.machine_id.clone());
+        active.enrolled_at = ActiveValue::set(Some(chrono::Local::now().into()));
+        Ok(active.update(db).await?)
+    }
+
+    /// Remember the last `install_dns_server` task sent to this agent.
+    pub async fn set_dns_install_task(
+        self,
+        db: &DatabaseConnection,
+        task_id: &str,
+    ) -> ModelResult<Self> {
+        let mut active: agents::ActiveModel = self.into();
+        active.dns_install_task_id = ActiveValue::set(Some(task_id.to_string()));
+        Ok(active.update(db).await?)
+    }
+
+    /// Every IPv4/IPv6 address this agent reported (public IP and the
+    /// interface addresses, without prefix lengths).
+    #[must_use]
+    pub fn addresses(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.public_ip.iter().cloned().collect();
+        if let serde_json::Value::Array(ifaces) =
+            json_column(self.interfaces.as_deref(), serde_json::Value::Null)
+        {
+            for iface in ifaces {
+                if let Some(addrs) = iface.get("addresses").and_then(serde_json::Value::as_array) {
+                    for a in addrs.iter().filter_map(serde_json::Value::as_str) {
+                        let ip = a.split('/').next().unwrap_or(a).to_string();
+                        if !out.contains(&ip) {
+                            out.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The address other servers should use to reach this agent: its public
+    /// IP, else its first non-loopback, non-link-local IPv4.
+    #[must_use]
+    pub fn reachable_ip(&self) -> Option<String> {
+        if let Some(ip) = self.public_ip.clone().filter(|s| !s.is_empty()) {
+            return Some(ip);
+        }
+        self.addresses().into_iter().find(|a| {
+            a.parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| !ip.is_loopback() && !ip.is_link_local())
+        })
+    }
+
     /// Find agent by UUID
     pub async fn find_by_agent_id(db: &DatabaseConnection, agent_id: &Uuid) -> ModelResult<Self> {
         let agent = agents::Entity::find()
@@ -98,9 +261,19 @@ impl Model {
             // returned to the enrolling agent carries the real values — an
             // agent that reads `monitored: false` out of an unset field would
             // go quiet the moment it came online.
-            environment: ActiveValue::set(DEFAULT_ENVIRONMENT.to_string()),
+            environment: ActiveValue::set(
+                params
+                    .environment
+                    .as_ref()
+                    .map(|e| e.trim().to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(|| DEFAULT_ENVIRONMENT.to_string()),
+            ),
             monitored: ActiveValue::set(true),
             monitor_note: ActiveValue::set(None),
+            machine_id: ActiveValue::set(params.machine_id.clone()),
+            enrollment_token_id: ActiveValue::set(params.enrollment_token_id),
+            metadata: ActiveValue::set(params.metadata.as_ref().map(ToString::to_string)),
             ..Default::default()
         }
         .insert(db)
@@ -190,6 +363,29 @@ impl Model {
         if params.capability_manifest.is_some() {
             active.capability_manifest = ActiveValue::set(params.capability_manifest.clone());
         }
+        if let Some(v) = params.machine_id.as_ref().filter(|v| !v.trim().is_empty()) {
+            active.machine_id = ActiveValue::set(Some(v.trim().to_string()));
+        }
+        if params.public_ip.is_some() {
+            active.public_ip = ActiveValue::set(params.public_ip.clone());
+        }
+        let json = |v: &Option<serde_json::Value>| v.as_ref().map(ToString::to_string);
+        if params.interfaces.is_some() {
+            active.interfaces = ActiveValue::set(json(&params.interfaces));
+        }
+        if params.listening.is_some() {
+            active.listening = ActiveValue::set(json(&params.listening));
+        }
+        if params.services.is_some() {
+            active.services = ActiveValue::set(json(&params.services));
+        }
+        if params.packages.is_some() {
+            active.packages = ActiveValue::set(json(&params.packages));
+        }
+        if params.dns_server.is_some() {
+            active.dns_server = ActiveValue::set(json(&params.dns_server));
+        }
+        active.facts_at = ActiveValue::set(Some(chrono::Local::now().into()));
         active.status = ActiveValue::set("healthy".to_string());
         active.last_heartbeat_at = ActiveValue::set(Some(chrono::Local::now().into()));
         Ok(active.update(db).await?)
