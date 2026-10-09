@@ -1,0 +1,72 @@
+# Production configuration (LOCO_ENV=production).
+#
+# Everything deployment-specific comes from the environment. At start Nexus
+# refuses to run without a strong NEXUS_SYSTEM_TOKEN, NEXUS_SECRET_KEY and
+# NEXUS_JWT_SECRET (see src/boot_checks.rs); no demo or admin data is seeded
+# and no development fallback token is accepted.
+#
+#   DATABASE_URL          required (postgres://… or sqlite://…)
+#   PORT                  default 5150
+#   NEXUS_PUBLIC_URL      the https:// URL agents and mailers reach Nexus on
+#   NEXUS_CORS_ORIGINS    comma-separated allowed origins; empty = CORS off
+#   NEXUS_JWT_SECRET      ≥ 32 characters, signs human session tokens
+#   NEXUS_TLS_CERT / NEXUS_TLS_KEY / NEXUS_TLS_CLIENT_CA   native HTTPS / mTLS
+#                         (served on the same PORT)
+#
+# An empty variable counts as unset (Compose passes optional ones as "").
+{% set nexus_log_level = get_env(name="NEXUS_LOG_LEVEL", default="") | trim %}
+{% set port = get_env(name="PORT", default="") | trim %}
+{% set nexus_public_url = get_env(name="NEXUS_PUBLIC_URL", default="") | trim %}
+{% set smtp_enable = get_env(name="SMTP_ENABLE", default="") | trim %}
+{% set smtp_host = get_env(name="SMTP_HOST", default="") | trim %}
+{% set smtp_port = get_env(name="SMTP_PORT", default="") | trim %}
+{% set smtp_secure = get_env(name="SMTP_SECURE", default="") | trim %}
+{% set db_connect_timeout = get_env(name="DB_CONNECT_TIMEOUT", default="") | trim %}
+{% set db_idle_timeout = get_env(name="DB_IDLE_TIMEOUT", default="") | trim %}
+{% set db_min_connections = get_env(name="DB_MIN_CONNECTIONS", default="") | trim %}
+{% set db_max_connections = get_env(name="DB_MAX_CONNECTIONS", default="") | trim %}
+{% set cors_origins = get_env(name="NEXUS_CORS_ORIGINS", default="") | trim %}
+logger:
+  enable: true
+  pretty_backtrace: false
+  level: {% if nexus_log_level %}{{ nexus_log_level }}{% else %}info{% endif %}
+  format: json
+
+server:
+  port: {% if port %}{{ port }}{% else %}5150{% endif %}
+  binding: 0.0.0.0
+  host: {% if nexus_public_url %}{{ nexus_public_url }}{% else %}http://localhost{% endif %}
+  middlewares:
+    cors:
+      enable: {% if cors_origins %}true{% else %}false{% endif %}
+      allow_origins: [{% for o in cors_origins | split(pat=",") %}{% if o | trim %}"{{ o | trim }}", {% endif %}{% endfor %}]
+      allow_headers:
+        - "*"
+      allow_methods:
+        - "*"
+
+workers:
+  mode: BackgroundAsync
+
+mailer:
+  smtp:
+    enable: {% if smtp_enable %}{{ smtp_enable }}{% else %}false{% endif %}
+    host: {% if smtp_host %}{{ smtp_host }}{% else %}localhost{% endif %}
+    port: {% if smtp_port %}{{ smtp_port }}{% else %}587{% endif %}
+    secure: {% if smtp_secure %}{{ smtp_secure }}{% else %}true{% endif %}
+
+database:
+  uri: {{ get_env(name="DATABASE_URL") }}
+  enable_logging: false
+  connect_timeout: {% if db_connect_timeout %}{{ db_connect_timeout }}{% else %}5000{% endif %}
+  idle_timeout: {% if db_idle_timeout %}{{ db_idle_timeout }}{% else %}600000{% endif %}
+  min_connections: {% if db_min_connections %}{{ db_min_connections }}{% else %}1{% endif %}
+  max_connections: {% if db_max_connections %}{{ db_max_connections }}{% else %}10{% endif %}
+  auto_migrate: true
+  dangerously_truncate: false
+  dangerously_recreate: false
+
+auth:
+  jwt:
+    secret: "{{ get_env(name="NEXUS_JWT_SECRET", default="") | trim }}"
+    expiration: 604800 # 7 days
