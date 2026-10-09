@@ -5,6 +5,8 @@ on:
       - master
       - main
   pull_request:
+  # release.yml runs these same jobs before it publishes anything.
+  workflow_call:
 
 env:
   RUST_TOOLCHAIN: stable
