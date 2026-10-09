@@ -281,6 +281,11 @@ async fn cloudflare_dns_zones_and_records() {
         );
         let zone_id = z["id"].as_str().unwrap().to_string();
         assert!(zone_id.starts_with("cf:"));
+        // Cloudflare's zone list carries no record count.
+        assert_eq!(z["recordCount"], Value::Null);
+        let (_, zones) = c.get("/api/v1/dns/zones").await;
+        assert_eq!(zones[0]["recordCount"], Value::Null);
+        assert!(zones[0].as_object().unwrap().contains_key("recordCount"));
         // The zone was created in the token's account.
         assert_eq!(
             stub.seen("POST", "/cf/zones")[0].body["account"]["id"],
@@ -494,6 +499,12 @@ async fn bind_zone_changes_dispatch_rendered_zone_files() {
         assert_eq!(z["serial"], today * 100 + 2);
         assert_eq!(z["lastTaskId"], task_id.as_str());
         assert_eq!(z["records"].as_array().unwrap().len(), 1);
+        assert_eq!(z["recordCount"], 1);
+        // The zone list counts BIND records without listing them.
+        let (_, zones) = c.get("/api/v1/dns/zones").await;
+        let listed = zones.as_array().unwrap().iter().find(|z| z["id"] == zone_id.as_str()).unwrap();
+        assert_eq!(listed["recordCount"], 1);
+        assert!(listed.get("records").is_none());
 
         // The primary's task carries the rendered zone file.
         let task = tasks::Model::find_by_task_id(&ctx.db, &task_id.parse().unwrap()).await.unwrap();
@@ -819,8 +830,11 @@ async fn volumes_mounts_and_load_balancers() {
             .await;
         assert_eq!(s, 400, "dropletIds and tag are exclusive");
 
-        // Not configured → 424.
+        // Not configured → 424. (The token was also stored from the
+        // environment at boot, so forget that copy too.)
         env.unset("DIGITALOCEAN_TOKEN");
+        let (s, _) = c.send("DELETE", "/api/v1/providers/digitalocean/credentials", None, &[]).await;
+        assert_eq!(s, 204);
         let (s, b) = c.get("/api/v1/cloud/volumes").await;
         assert_eq!((s, b["error"].as_str()), (424, Some("provider_not_configured")));
     })
@@ -838,7 +852,25 @@ async fn install_script_and_binaries_are_public() {
         let script = resp.text();
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains("NEXUS_URL=${NEXUS_URL:-https://nexus.example.com}"));
+        // The plan signing key is pinned by default; a CA and another key
+        // can be passed in, and both land in the agent's env file.
+        let key: Value = request.get("/api/v1/signing-key").await.json();
+        let pubkey = key["publicKey"].as_str().unwrap();
+        assert!(script.contains(&format!(
+            "NEXUS_SIGNING_PUBKEY=${{NEXUS_SIGNING_PUBKEY:-${{LINEXUS_SIGNING_PUBKEY:-{pubkey}}}}}"
+        )));
+        let syntax = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "the installer parses");
         for needle in [
+            "LINEXUS_SIGNING_PUBKEY=$SIGNING_PUBKEY",
+            "LINEXUS_CA_FILE=$CA_FILE",
+            "CA_FILE=/etc/linexus/nexus-ca.pem",
+            "NEXUS_CA_PEM",
+            "NEXUS_CA_FILE",
+            "--cacert",
             "/usr/local/bin/linexus-agent",
             "/etc/linexus/agent.env",
             "AGENT_STATE_FILE=$STATE_FILE",

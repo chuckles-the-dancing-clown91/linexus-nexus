@@ -39,6 +39,12 @@ impl Env {
             "NEXUS_PUBLIC_URL",
             "LINEXUS_AGENT_BINARY_DIR",
             "DAEDALUS_INGEST_URL",
+            "NEXUS_SIGNING_KEY",
+            "NEXUS_PLAN_TTL_SECS",
+            "NEXUS_REQUIRE_OPERATOR_CERT",
+            "NEXUS_TLS_CERT",
+            "NEXUS_TLS_KEY",
+            "NEXUS_TLS_CLIENT_CA",
         ] {
             e.unset(v);
         }
@@ -106,6 +112,7 @@ pub struct StubState {
     pub volumes: Vec<Value>,
     pub lbs: Vec<Value>,
     pub domains: Vec<Value>,
+    pub snapshots: Vec<Value>,
     pub next: u64,
 }
 
@@ -417,6 +424,29 @@ async fn handle(
             Some(v) => Json(json!({"volume": v})).into_response(),
             None => not_found(),
         },
+        ("GET", ["v2", "snapshots", id]) => match s.snapshots.iter().find(|v| v["id"].to_string().trim_matches('"') == *id) {
+            Some(v) => Json(json!({"snapshot": v})).into_response(),
+            None => not_found(),
+        },
+        ("DELETE", ["v2", "snapshots", id]) => {
+            let before = s.snapshots.len();
+            s.snapshots
+                .retain(|v| v["id"].to_string().trim_matches('"') != *id);
+            if s.snapshots.len() == before {
+                return not_found();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        ("GET", ["v2", "certificates"]) => Json(json!({
+            "certificates": [{
+                "id": "892071a0-bb95-49bc-8021-3afd67a210bf", "name": "web-cert-01",
+                "not_after": "2027-02-22T00:23:00Z", "sha1_fingerprint": "dfcc9f57d86bf58e321c2c6c31c7a971be244ac7",
+                "created_at": "2026-02-08T16:02:37Z", "dns_names": ["www.example.com", "example.com"],
+                "state": "verified", "type": "lets_encrypt",
+            }],
+            "links": {}, "meta": {"total": 1},
+        }))
+        .into_response(),
         ("POST", ["v2", "load_balancers"]) => {
             let mut lb = body.clone();
             lb["id"] = json!(format!("{:08x}-1111-4000-8000-{:012x}", n, n));
