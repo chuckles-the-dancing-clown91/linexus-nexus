@@ -22,11 +22,17 @@ use std::time::Duration;
 use serde_json::Value;
 
 fn orch_url() -> String {
-    std::env::var("LINEXUS_ORCH_URL").unwrap_or_else(|_| "http://127.0.0.1:5152".to_string())
+    std::env::var("LINEXUS_ORCH_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:5152".to_string())
 }
 
 fn logger_url() -> String {
-    std::env::var("LINEXUS_LOGGER_URL").unwrap_or_else(|_| "http://127.0.0.1:5151".to_string())
+    std::env::var("LINEXUS_LOGGER_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:5151".to_string())
 }
 
 fn service_token() -> Option<String> {

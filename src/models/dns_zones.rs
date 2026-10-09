@@ -1,7 +1,7 @@
 //! BIND zones and their records (Nexus is the source of truth for them).
 
 use loco_rs::prelude::*;
-use sea_orm::{ActiveValue, QueryOrder};
+use sea_orm::{ActiveValue, PaginatorTrait, QueryOrder};
 use uuid::Uuid;
 
 pub use super::_entities::dns_records::{
@@ -67,6 +67,14 @@ impl Model {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default()
+    }
+
+    /// How many records the zone holds.
+    pub async fn record_count(&self, db: &DatabaseConnection) -> ModelResult<u64> {
+        Ok(RecordEntity::find()
+            .filter(dns_records::Column::ZoneId.eq(self.zone_id))
+            .count(db)
+            .await?)
     }
 
     pub async fn records(&self, db: &DatabaseConnection) -> ModelResult<Vec<Record>> {

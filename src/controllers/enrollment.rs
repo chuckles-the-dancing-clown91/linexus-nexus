@@ -12,7 +12,7 @@ use loco_rs::prelude::{get, AppContext, Routes};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::api::{operator, ApiError, ApiJson, ApiResult};
+use super::api::{operator, scope, ApiError, ApiJson, ApiResult};
 use crate::models::enrollment_tokens::{self, MintParams};
 
 pub const DEFAULT_TTL_MINUTES: i64 = 1440;
@@ -156,7 +156,7 @@ pub async fn create(
     headers: HeaderMap,
     ApiJson(req): ApiJson<MintRequest>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::ENROLL).await?;
     let created_by = super::api::requester(&headers, &svc)?;
     let params = mint_params(&req, Some(created_by))?;
     let (row, plaintext) = enrollment_tokens::Model::mint(&ctx.db, &params).await?;
@@ -170,7 +170,7 @@ pub async fn create(
 
 /// `GET /api/v1/enrollment-tokens` — newest first, without `token`.
 pub async fn list(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::ENROLL).await?;
     let rows = enrollment_tokens::Model::list(&ctx.db).await?;
     let out: Vec<Value> = rows.iter().map(|t| token_json(t, None)).collect();
     Ok(axum::Json(out).into_response())
@@ -182,7 +182,7 @@ pub async fn show(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::ENROLL).await?;
     Ok(axum::Json(token_json(&find(&ctx, &id).await?, None)).into_response())
 }
 
@@ -192,7 +192,7 @@ pub async fn revoke(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::ENROLL).await?;
     let row = find(&ctx, &id).await?.revoke(&ctx.db).await?;
     tracing::info!(token_id = %row.token_id, "enrollment token revoked");
     Ok(StatusCode::NO_CONTENT.into_response())

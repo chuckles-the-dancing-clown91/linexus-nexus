@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::api::{operator, require_confirm, run_op, ApiError, ApiJson, ApiResult, Op};
+use super::api::{operator, require_confirm, run_op, scope, ApiError, ApiJson, ApiResult, Op};
 use super::enrollment::{mint_params, MintRequest};
 use crate::dispatch::{self, DispatchRequest};
 use crate::models::{agents, enrollment_tokens};
@@ -113,7 +113,7 @@ async fn all_agents(ctx: &AppContext) -> ApiResult<Vec<agents::Model>> {
 
 /// `GET /api/v1/cloud/account`.
 pub async fn account(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let a = do_.account().await?;
     // A token without billing scope still gets its account (balance null).
@@ -128,7 +128,7 @@ fn catalog_cache() -> &'static Mutex<Option<(String, Instant, Value)>> {
 
 /// `GET /api/v1/cloud/catalog` — regions, sizes, distribution images; cached 1 h.
 pub async fn catalog(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let key = do_.cache_key();
     let mut cache = catalog_cache().lock().await;
@@ -170,7 +170,7 @@ pub async fn list_droplets(
     headers: HeaderMap,
     Query(q): Query<TagQuery>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let mut query = Vec::new();
     if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -194,7 +194,7 @@ pub async fn get_droplet(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let id = droplet_id(&id)?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let d = do_.droplet(id).await?;
@@ -273,7 +273,7 @@ pub async fn create_droplet(
     headers: HeaderMap,
     ApiJson(req): ApiJson<CreateDroplet>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let name = required(req.name.as_ref(), "name")?.to_string();
     if !valid_name(&name) {
         return Err(ApiError::invalid("name: letters, digits, dots and dashes"));
@@ -321,6 +321,8 @@ pub async fn create_droplet(
     // operation so an idempotent replay never mints a second one.
     let enroll = match &req.enroll_agent {
         Some(spec) => {
+            // It mints an enrollment token, so it needs that scope too.
+            super::api::require_scope(&svc, scope::ENROLL)?;
             let url = public_url().ok_or_else(|| {
                 ApiError::invalid(
                     "enrollAgent: NEXUS_PUBLIC_URL is not set (or not a plain http(s) URL); the droplet could never call home",
@@ -429,7 +431,7 @@ pub async fn droplet_action(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<DropletAction>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = droplet_id(&id)?;
     let t = required(req.action_type.as_ref(), "type")?.to_string();
     if !DROPLET_ACTIONS.contains(&t.as_str()) {
@@ -500,7 +502,7 @@ pub async fn droplet_snapshots(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let id = droplet_id(&id)?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let snaps = do_
@@ -516,7 +518,7 @@ pub async fn delete_droplet(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = droplet_id(&id)?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let d = do_.droplet(id).await?;
@@ -540,13 +542,55 @@ pub async fn delete_droplet(
     .await
 }
 
+/// A snapshot id from the path: a droplet snapshot's number or a volume
+/// snapshot's UUID.
+fn snapshot_id(raw: &str) -> ApiResult<String> {
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.len() <= 20 && raw.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(raw.to_string());
+    }
+    uuid::Uuid::parse_str(raw)
+        .map(|u| u.to_string())
+        .map_err(|_| ApiError::not_found(format!("no such snapshot: {raw}")))
+}
+
+/// `DELETE /api/v1/cloud/snapshots/{id}` — needs `X-Confirm: <snapshot name>`.
+pub async fn delete_snapshot(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
+    let id = snapshot_id(&id)?;
+    let do_ = DigitalOcean::from_ctx(&ctx).await?;
+    let snap = do_.snapshot(&id).await?;
+    let name = snap
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    require_confirm(&headers, &name)?;
+    let op = Op::new(
+        &headers,
+        &svc,
+        DIGITALOCEAN,
+        "snapshot.delete",
+        format!("{id} {name}"),
+    )?;
+    run_op(&ctx, op, || async {
+        do_.delete(&format!("/v2/snapshots/{id}"), None).await?;
+        Ok((StatusCode::NO_CONTENT, Value::Null))
+    })
+    .await
+}
+
 /// `GET /api/v1/cloud/actions/{id}`.
 pub async fn get_action(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let id: u64 = id
         .trim()
         .parse()
@@ -566,7 +610,7 @@ pub async fn list_volumes(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let vols = do_.list("/v2/volumes", "volumes", &[]).await?;
     let out: Vec<Value> = vols.iter().map(dox::volume_json).collect();
@@ -607,7 +651,7 @@ pub async fn create_volume(
     headers: HeaderMap,
     ApiJson(req): ApiJson<CreateVolume>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let name = required(req.name.as_ref(), "name")?.to_string();
     if !valid_volume_name(&name) {
         return Err(ApiError::invalid(
@@ -699,7 +743,7 @@ pub async fn volume_action(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<VolumeAction>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "volume")?;
     let t = required(req.action_type.as_ref(), "type")?.to_string();
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
@@ -783,7 +827,7 @@ pub async fn mount_volume(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<MountVolume>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "volume")?;
     let agent_raw = required(req.agent_id.as_ref(), "agentId")?;
     let agent_id =
@@ -857,7 +901,7 @@ pub async fn delete_volume(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "volume")?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let vol = do_.volume(&id).await?;
@@ -887,7 +931,7 @@ pub async fn delete_volume(
 
 /// `GET /api/v1/cloud/load-balancers`.
 pub async fn list_lbs(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let lbs = do_
         .list("/v2/load_balancers", "load_balancers", &[])
@@ -902,7 +946,7 @@ pub async fn get_lb(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let id = resource_uuid(&id, "load balancer")?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     Ok(axum::Json(dox::load_balancer_json(&do_.load_balancer(&id).await?)).into_response())
@@ -1099,7 +1143,7 @@ pub async fn create_lb(
     headers: HeaderMap,
     ApiJson(spec): ApiJson<LoadBalancerSpec>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let (name, body) = lb_body(&spec)?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let op = Op::new(&headers, &svc, DIGITALOCEAN, "load_balancer.create", name)?;
@@ -1118,7 +1162,7 @@ pub async fn update_lb(
     Path(id): Path<String>,
     ApiJson(spec): ApiJson<LoadBalancerSpec>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "load balancer")?;
     let (name, body) = lb_body(&spec)?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
@@ -1151,7 +1195,7 @@ async fn lb_droplets(
     req: LbDroplets,
     add: bool,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "load balancer")?;
     let ids = req
         .droplet_ids
@@ -1209,7 +1253,7 @@ pub async fn delete_lb(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let id = resource_uuid(&id, "load balancer")?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let lb = do_.load_balancer(&id).await?;
@@ -1243,15 +1287,26 @@ pub async fn list_firewalls(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let items = do_.list("/v2/firewalls", "firewalls", &[]).await?;
     Ok(axum::Json(items.iter().map(camelize).collect::<Vec<_>>()).into_response())
 }
 
+/// `GET /api/v1/cloud/certificates` — for load-balancer HTTPS rules.
+pub async fn list_certificates(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
+    let do_ = DigitalOcean::from_ctx(&ctx).await?;
+    let items = do_.list("/v2/certificates", "certificates", &[]).await?;
+    Ok(axum::Json(items.iter().map(dox::certificate_json).collect::<Vec<_>>()).into_response())
+}
+
 /// `GET /api/v1/cloud/vpcs` — DigitalOcean's objects, keys camelCased.
 pub async fn list_vpcs(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let do_ = DigitalOcean::from_ctx(&ctx).await?;
     let items = do_.list("/v2/vpcs", "vpcs", &[]).await?;
     Ok(axum::Json(items.iter().map(camelize).collect::<Vec<_>>()).into_response())
@@ -1269,6 +1324,10 @@ pub fn routes() -> Routes {
         )
         .add("/cloud/droplets/{id}/actions", post(droplet_action))
         .add("/cloud/droplets/{id}/snapshots", get(droplet_snapshots))
+        .add(
+            "/cloud/snapshots/{id}",
+            axum::routing::delete(delete_snapshot),
+        )
         .add("/cloud/actions/{id}", get(get_action))
         .add("/cloud/volumes", get(list_volumes).post(create_volume))
         .add("/cloud/volumes/{id}", axum::routing::delete(delete_volume))
@@ -1285,6 +1344,7 @@ pub fn routes() -> Routes {
         )
         .add("/cloud/firewalls", get(list_firewalls))
         .add("/cloud/vpcs", get(list_vpcs))
+        .add("/cloud/certificates", get(list_certificates))
 }
 
 #[cfg(test)]

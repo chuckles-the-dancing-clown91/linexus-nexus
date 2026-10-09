@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 
 /// Environment variable holding the sealing key material.
 pub const ENV_SECRET_KEY: &str = "NEXUS_SECRET_KEY";
-const DEV_KEY_MATERIAL: &str = "linexus-nexus-development-secret-key (do not use in production)";
+pub const DEV_KEY_MATERIAL: &str =
+    "linexus-nexus-development-secret-key (do not use in production)";
 const NONCE_LEN: usize = 12;
 
 #[derive(Debug, PartialEq, Eq)]

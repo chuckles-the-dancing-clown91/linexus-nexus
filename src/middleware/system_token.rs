@@ -6,13 +6,16 @@
 //!
 //! A service presents its token in the `X-Nexus-System-Token` header. The guard
 //! accepts either:
-//! * the configured **root** token (env `NEXUS_SYSTEM_TOKEN`, with a dev
-//!   fallback so the stack runs out of the box), which carries the `*` scope; or
+//! * the configured **root** token (env `NEXUS_SYSTEM_TOKEN`; in development
+//!   and test only, a fixed fallback so the stack runs out of the box), which
+//!   carries the `*` scope; or
 //! * any active token in the `system_tokens` table, matched by SHA-256 hash,
 //!   carrying that token's stored scopes.
+//!
+//! On `/api/v1` the scopes in [`scope`] gate operator routes (`*` = all).
 
 use axum::http::HeaderMap;
-use loco_rs::prelude::*;
+use loco_rs::{environment::Environment, prelude::*};
 
 use crate::models::{agents, enrollment_tokens, system_tokens};
 
@@ -20,8 +23,37 @@ use crate::models::{agents, enrollment_tokens, system_tokens};
 pub const HEADER: &str = "x-nexus-system-token";
 /// Environment variable holding the root system token.
 pub const ENV_ROOT_TOKEN: &str = "NEXUS_SYSTEM_TOKEN";
-/// Development fallback root token. Override in any real deployment.
+/// Development / test fallback root token. Never accepted anywhere else.
 pub const DEV_ROOT_TOKEN: &str = "dev-nexus-system-token";
+
+/// The scopes an operator token needs on `/api/v1` (`docs/PROVIDERS.md`).
+/// `*` grants all of them, `prefix:*` all under a prefix.
+pub mod scope {
+    /// Agent inventory, facts, logs, environment reads.
+    pub const AGENTS_READ: &str = "agents:read";
+    /// Adopting agents (system-key enrollment), setting their environment,
+    /// and the agent routes when called with a system key.
+    pub const AGENTS_WRITE: &str = "agents:write";
+    pub const TASKS_READ: &str = "tasks:read";
+    /// Creating and cancelling tasks, and reporting results with a system key.
+    pub const TASKS_WRITE: &str = "tasks:write";
+    /// Providers, DNS, domains, cloud and the operations log.
+    pub const INFRA_READ: &str = "infra:read";
+    /// Provider credentials, DNS / domain / cloud mutations.
+    pub const INFRA_WRITE: &str = "infra:write";
+    /// Minting, reading and revoking enrollment tokens.
+    pub const ENROLL: &str = "enroll";
+    /// Every `/api/v1` scope.
+    pub const ALL: [&str; 7] = [
+        AGENTS_READ,
+        AGENTS_WRITE,
+        TASKS_READ,
+        TASKS_WRITE,
+        INFRA_READ,
+        INFRA_WRITE,
+        ENROLL,
+    ];
+}
 
 /// The validated identity of a calling service.
 #[derive(Debug, Clone)]
@@ -56,9 +88,29 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Resolve the configured root token, falling back to the dev value.
-fn root_token() -> String {
-    std::env::var(ENV_ROOT_TOKEN).unwrap_or_else(|_| DEV_ROOT_TOKEN.to_string())
+/// The configured root token. Only development and test fall back to
+/// [`DEV_ROOT_TOKEN`]; elsewhere an unset token means there is no root token
+/// (and a production boot refuses to start without one).
+fn root_token(environment: &Environment) -> Option<String> {
+    match std::env::var(ENV_ROOT_TOKEN) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ if matches!(environment, Environment::Development | Environment::Test) => {
+            Some(DEV_ROOT_TOKEN.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `token` is the root token in `environment`.
+fn is_root(environment: &Environment, token: &str) -> bool {
+    root_token(environment).is_some_and(|root| constant_time_eq(token, &root))
+}
+
+fn root_context() -> SystemContext {
+    SystemContext {
+        service: "root".to_string(),
+        scopes: vec!["*".to_string()],
+    }
 }
 
 /// Authenticate a request by its system token header, returning the calling
@@ -71,11 +123,8 @@ pub async fn authenticate(ctx: &AppContext, headers: &HeaderMap) -> Result<Syste
         .filter(|s| !s.is_empty())
         .ok_or_else(|| loco_rs::Error::Unauthorized("missing system token".to_string()))?;
 
-    if constant_time_eq(token, &root_token()) {
-        return Ok(SystemContext {
-            service: "root".to_string(),
-            scopes: vec!["*".to_string()],
-        });
+    if is_root(&ctx.environment, token) {
+        return Ok(root_context());
     }
 
     let hash = system_tokens::hash_token(token);
@@ -108,11 +157,8 @@ pub async fn validate_token(ctx: &AppContext, token: &str) -> Result<SystemConte
         ));
     }
 
-    if constant_time_eq(token, &root_token()) {
-        return Ok(SystemContext {
-            service: "root".to_string(),
-            scopes: vec!["*".to_string()],
-        });
+    if is_root(&ctx.environment, token) {
+        return Ok(root_context());
     }
 
     let hash = system_tokens::hash_token(token);

@@ -20,11 +20,12 @@ use loco_rs::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::controllers::api::{ApiError, ApiJson, ApiResult};
+use crate::controllers::api::{agent_or_operator, operator, scope, ApiError, ApiJson, ApiResult};
 use crate::dispatch::{self, DispatchRequest};
 use crate::gateway_client;
-use crate::middleware::system_token::{self, Caller};
+use crate::middleware::system_token::Caller;
 use crate::models::{agents, enrollment_tokens, tasks};
+use crate::signing;
 
 // ---------------------------------------------------------------------------
 // Projection to the Daedalus IT contract
@@ -135,11 +136,11 @@ fn agent_detail_json(a: &agents::Model) -> Value {
 // ---------------------------------------------------------------------------
 
 /// `GET /api/v1/agents` — agent inventory.
-pub async fn list_agents(State(ctx): State<AppContext>, headers: HeaderMap) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+pub async fn list_agents(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::AGENTS_READ).await?;
     let all = agents::Model::find_all(&ctx.db).await?;
     let out: Vec<Value> = all.iter().map(agent_json).collect();
-    format::json(out)
+    Ok(format::json(out)?)
 }
 
 /// `GET /api/v1/agents/{id}` — one agent's full record.
@@ -147,11 +148,10 @@ pub async fn get_agent(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
-    let uuid = parse_uuid(&id)?;
-    let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
-    format::json(agent_detail_json(&agent))
+) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::AGENTS_READ).await?;
+    let agent = find_agent(&ctx, &id).await?;
+    Ok(format::json(agent_detail_json(&agent))?)
 }
 
 /// `GET /api/v1/agents/{id}/services` — the services in the last report.
@@ -160,7 +160,7 @@ pub async fn agent_services(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::AGENTS_READ).await?;
     let agent = find_agent(&ctx, &id).await?;
     Ok(axum::Json(json!({
         "services": agents::json_column(agent.services.as_deref(), json!([])),
@@ -174,7 +174,7 @@ pub async fn agent_packages(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::AGENTS_READ).await?;
     let agent = find_agent(&ctx, &id).await?;
     Ok(axum::Json(json!({
         "packages": agents::json_column(agent.packages.as_deref(), json!([])),
@@ -205,8 +205,8 @@ pub async fn agent_logs(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<LogsQuery>,
-) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::AGENTS_READ).await?;
     let uuid = parse_uuid(&id)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
 
@@ -225,7 +225,7 @@ pub async fn agent_logs(
             })
         })
         .collect();
-    format::json(lines)
+    Ok(format::json(lines)?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,8 +251,8 @@ pub async fn create_task(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Json(req): Json<CreateTaskRequest>,
-) -> Result<Response> {
-    let svc = system_token::authenticate_bearer(&ctx, &headers).await?;
+) -> ApiResult<Response> {
+    let svc = operator(&ctx, &headers, scope::TASKS_WRITE).await?;
     let created_by = if req.requester_id.is_empty() {
         format!("service:{}", svc.service)
     } else {
@@ -269,7 +269,9 @@ pub async fn create_task(
         },
     )
     .await?;
-    format::json(json!({ "taskId": task.task_id.to_string(), "status": task.status }))
+    Ok(format::json(
+        json!({ "taskId": task.task_id.to_string(), "status": task.status }),
+    )?)
 }
 
 /// `POST /api/v1/tasks/{id}/cancel` — cancel a task that has not finished.
@@ -280,7 +282,7 @@ pub async fn cancel_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::TASKS_WRITE).await?;
     let tid = uuid::Uuid::parse_str(&id).map_err(|_| ApiError::not_found("no such task"))?;
     match dispatch::cancel(&ctx, &tid).await {
         Ok(true) => Ok(
@@ -351,6 +353,11 @@ pub async fn enroll(
         ));
     }
     let token = clean_field(req.enrollment_token.as_deref(), "enrollmentToken", 128)?;
+    // Resolved before anything is written: an enrollment that cannot hand
+    // the agent the key to pin must not spend a token use.
+    let signer = signing::signer(&ctx)
+        .await
+        .map_err(|e| ApiError::internal(&e))?;
     let existing = match &machine_id {
         Some(m) => agents::Model::find_by_machine_id(&ctx.db, m).await?,
         None => None,
@@ -392,7 +399,7 @@ pub async fn enroll(
         params.metadata = Some(row.metadata_value());
         Some(row)
     } else {
-        system_token::authenticate_bearer(&ctx, &headers).await?;
+        operator(&ctx, &headers, scope::AGENTS_WRITE).await?;
         None
     };
 
@@ -429,6 +436,7 @@ pub async fn enroll(
             agents::json_column(agent.metadata.as_deref(), json!({})),
         );
         map.insert("readopted".into(), json!(readopted));
+        map.insert("signingKey".into(), signer.public_json());
     }
     Ok((axum::http::StatusCode::CREATED, axum::Json(body)).into_response())
 }
@@ -476,9 +484,9 @@ pub async fn report(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ReportRequest>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let uuid = parse_uuid(&id)?;
-    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    agent_or_operator(&ctx, &headers, &uuid, scope::AGENTS_WRITE).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     let params = agents::ReportFactsParams {
         hostname: req.hostname,
@@ -506,7 +514,7 @@ pub async fn report(
         dns_server: req.dns_server.filter(Value::is_object),
     };
     let updated = agent.report_facts(&ctx.db, &params).await?;
-    format::json(agent_detail_json(&updated))
+    Ok(format::json(agent_detail_json(&updated))?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,8 +545,8 @@ pub async fn set_environment(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<SetEnvironmentRequest>,
-) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::AGENTS_WRITE).await?;
     let uuid = parse_uuid(&id)?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
 
@@ -578,7 +586,7 @@ pub async fn set_environment(
         tracing::warn!(error = %e, "failed to ship environment audit log");
     }
 
-    format::json(environment_json(&updated))
+    Ok(format::json(environment_json(&updated))?)
 }
 
 /// `GET /api/v1/agents/{id}/environment` — what the inventory authority
@@ -588,11 +596,11 @@ pub async fn get_environment(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let uuid = parse_uuid(&id)?;
-    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    agent_or_operator(&ctx, &headers, &uuid, scope::AGENTS_READ).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
-    format::json(environment_json(&agent))
+    Ok(format::json(environment_json(&agent))?)
 }
 
 /// `POST /api/v1/agents/{id}/heartbeat` — liveness signal.
@@ -600,12 +608,12 @@ pub async fn heartbeat(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let uuid = parse_uuid(&id)?;
-    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    agent_or_operator(&ctx, &headers, &uuid, scope::AGENTS_WRITE).await?;
     let agent = agents::Model::find_by_agent_id(&ctx.db, &uuid).await?;
     let updated = agent.heartbeat(&ctx.db).await?;
-    format::json(agent_json(&updated))
+    Ok(format::json(agent_json(&updated))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -622,9 +630,14 @@ pub async fn poll_tasks(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let uuid = parse_uuid(&id)?;
-    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    agent_or_operator(&ctx, &headers, &uuid, scope::TASKS_READ).await?;
+    let signer = signing::signer(&ctx)
+        .await
+        .map_err(|e| ApiError::internal(&e))?;
+    let ttl = signing::plan_ttl_secs();
+    let agent_id = uuid.to_string();
     if let Err(e) = dispatch::replan_for_agent(&ctx, &uuid.to_string()).await {
         tracing::warn!(error = %e, "re-planning accepted tasks on poll failed");
     }
@@ -637,11 +650,24 @@ pub async fn poll_tasks(
             .as_ref()
             .and_then(|p| serde_json::from_str::<Value>(p).ok())
             .unwrap_or(Value::Null);
+        let task_id = t.task_id.to_string();
+        // Signed at delivery: every poll gets a fresh issuedAt / expiresAt /
+        // nonce over exactly the plan delivered alongside (§12).
+        let payload = signing::PlanPayload {
+            task_id: &task_id,
+            agent_id: &agent_id,
+            intent: &t.intent,
+            plan: &plan,
+            issued_at: Utc::now(),
+            ttl_secs: ttl,
+        }
+        .to_bytes();
         out.push(json!({
-            "taskId": t.task_id.to_string(),
+            "taskId": task_id,
             "intent": t.intent.clone(),
             "status": t.status.clone(),
             "autoRollback": plan.get("auto_rollback").and_then(Value::as_bool).unwrap_or(false),
+            "envelope": signer.envelope(&payload),
             "plan": plan,
         }));
         // Best-effort: mark dispatched so it isn't treated as freshly planned.
@@ -649,7 +675,7 @@ pub async fn poll_tasks(
             tracing::warn!(error = %e, "failed to mark task dispatched");
         }
     }
-    format::json(out)
+    Ok(format::json(out)?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,6 +718,10 @@ pub struct StepResultRequest {
     pub output: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
 }
 
 impl From<StepResultRequest> for tasks::StepResult {
@@ -703,6 +733,8 @@ impl From<StepResultRequest> for tasks::StepResult {
             changed: s.changed.unwrap_or(false),
             output: s.output.unwrap_or_default(),
             error: s.error.unwrap_or_default(),
+            name: s.name.unwrap_or_default(),
+            exit_code: s.exit_code,
         }
     }
 }
@@ -739,15 +771,15 @@ pub async fn report_result(
     headers: HeaderMap,
     Path((id, task_id)): Path<(String, String)>,
     Json(req): Json<TaskResultRequest>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let agent_uuid = parse_uuid(&id)?;
-    let caller = system_token::authorize_agent(&ctx, &headers, &agent_uuid).await?;
+    let caller = agent_or_operator(&ctx, &headers, &agent_uuid, scope::TASKS_WRITE).await?;
     let tid = parse_uuid(&task_id)?;
 
     let task = tasks::Model::find_by_task_id(&ctx.db, &tid).await?;
     // An agent reports only on its own tasks.
     if matches!(caller, Caller::Agent(_)) && !task.targets_agent(&agent_uuid.to_string()) {
-        return Err(loco_rs::Error::NotFound);
+        return Err(ApiError::not_found("no such task"));
     }
     let final_status = if req.status == "success" {
         "completed"
@@ -819,7 +851,9 @@ pub async fn report_result(
         tracing::warn!(error = %e, task_id = %task_id, "failed to forward result to Daedalus IT");
     }
 
-    format::json(json!({ "taskId": updated.task_id.to_string(), "status": updated.status }))
+    Ok(format::json(
+        json!({ "taskId": updated.task_id.to_string(), "status": updated.status }),
+    )?)
 }
 
 /// The `result` block of a task: what the agent reported, or `null` while the
@@ -841,8 +875,10 @@ fn task_result_json(t: &tasks::Model) -> Value {
         .map(|s| {
             json!({
                 "id": s.id,
+                "name": s.display_name(),
                 "action": s.action,
                 "status": s.status,
+                "exitCode": s.display_exit_code(),
                 "changed": s.changed,
                 "output": s.output,
                 "error": s.error,
@@ -887,19 +923,21 @@ pub async fn get_task(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Response> {
-    system_token::authenticate_bearer(&ctx, &headers).await?;
+) -> ApiResult<Response> {
+    operator(&ctx, &headers, scope::TASKS_READ).await?;
     let not_found = || {
-        format::render()
-            .status(axum::http::StatusCode::NOT_FOUND)
-            .json(json!({ "error": "not_found" }))
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "not_found" })),
+        )
+            .into_response()
     };
     let Ok(tid) = uuid::Uuid::parse_str(&id) else {
-        return not_found();
+        return Ok(not_found());
     };
     match tasks::Model::find_by_task_id(&ctx.db, &tid).await {
-        Ok(task) => format::json(task_json(&task)),
-        Err(ModelError::EntityNotFound) => not_found(),
+        Ok(task) => Ok(format::json(task_json(&task))?),
+        Err(ModelError::EntityNotFound) => Ok(not_found()),
         Err(e) => Err(e.into()),
     }
 }
@@ -933,9 +971,9 @@ pub async fn ship_agent_logs(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<ShipLogBody>,
-) -> Result<Response> {
+) -> ApiResult<Response> {
     let uuid = parse_uuid(&id)?;
-    system_token::authorize_agent(&ctx, &headers, &uuid).await?;
+    agent_or_operator(&ctx, &headers, &uuid, scope::AGENTS_WRITE).await?;
 
     let entries = match body {
         ShipLogBody::One(e) => vec![e],
@@ -956,12 +994,22 @@ pub async fn ship_agent_logs(
             .map_err(|err| loco_rs::Error::Any(err.into()))?;
         ingested += 1;
     }
-    format::json(json!({ "ingested": ingested }))
+    Ok(format::json(json!({ "ingested": ingested }))?)
+}
+
+/// `GET /api/v1/signing-key` (public) — the key agents verify plan
+/// envelopes with: `{alg: "ed25519", keyId, publicKey}` (§12).
+pub async fn signing_key(State(ctx): State<AppContext>) -> ApiResult<Response> {
+    let signer = signing::signer(&ctx)
+        .await
+        .map_err(|e| ApiError::internal(&e))?;
+    Ok(axum::Json(signer.public_json()).into_response())
 }
 
 pub fn routes() -> Routes {
     Routes::new()
         .prefix("api/v1")
+        .add("/signing-key", get(signing_key))
         .add("/agents", get(list_agents))
         .add("/agents/enroll", post(enroll))
         .add("/agents/{id}", get(get_agent))

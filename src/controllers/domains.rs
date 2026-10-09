@@ -12,7 +12,7 @@ use loco_rs::prelude::{get, AppContext, Routes};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::api::{operator, run_op, ApiError, ApiJson, ApiResult, Op};
+use super::api::{operator, run_op, scope, ApiError, ApiJson, ApiResult, Op};
 use crate::providers::{
     cloudflare::{domain_json, Cloudflare},
     dns::{normalize_zone_name, valid_zone_name, CF_PREFIX},
@@ -50,7 +50,7 @@ async fn one(cf: &Cloudflare, name: &str) -> ApiResult<Value> {
 
 /// `GET /api/v1/domains`.
 pub async fn list(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let cf = Cloudflare::from_ctx(&ctx).await?;
     let domains = cf.registrar_domains().await?;
     let zones = zone_ids(&cf).await?;
@@ -74,7 +74,7 @@ pub async fn show(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let name = domain_name(&name)?;
     let cf = Cloudflare::from_ctx(&ctx).await?;
     Ok(axum::Json(one(&cf, &name).await?).into_response())
@@ -98,7 +98,7 @@ pub async fn update(
     Path(name): Path<String>,
     ApiJson(req): ApiJson<PatchDomain>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let name = domain_name(&name)?;
     let mut body = json!({});
     if let Some(v) = req.auto_renew {

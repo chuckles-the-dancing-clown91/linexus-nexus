@@ -7,7 +7,9 @@ use loco_rs::prelude::{get, patch, post, AppContext, Routes};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::api::{operator, requester, require_confirm, run_op, ApiError, ApiJson, ApiResult, Op};
+use super::api::{
+    operator, requester, require_confirm, run_op, scope, ApiError, ApiJson, ApiResult, Op,
+};
 use crate::dispatch::{self, DispatchRequest};
 use crate::models::agents;
 use crate::providers::{
@@ -40,7 +42,7 @@ fn change_value(c: &RecordChange) -> Value {
 
 /// `GET /api/v1/dns/zones` — every zone of every configured provider.
 pub async fn list_zones(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_READ).await?;
     let who = requester(&headers, &svc)?;
     let mut zones = Vec::new();
     if providers::credentials(&ctx, CLOUDFLARE).await?.is_some() {
@@ -67,7 +69,7 @@ pub async fn create_zone(
     headers: HeaderMap,
     ApiJson(req): ApiJson<CreateZone>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let provider: &'static str = match req.provider.trim() {
         CLOUDFLARE => CLOUDFLARE,
         BIND => BIND,
@@ -93,7 +95,7 @@ pub async fn get_zone(
     headers: HeaderMap,
     Path(zone_id): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_READ).await?;
     let (p, id) = dns::provider_for(&ctx, &zone_id, &requester(&headers, &svc)?).await?;
     Ok(axum::Json(zone_value(&p.get_zone(&id, true).await?)).into_response())
 }
@@ -104,7 +106,7 @@ pub async fn delete_zone(
     headers: HeaderMap,
     Path(zone_id): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let who = requester(&headers, &svc)?;
     let (p, id) = dns::provider_for(&ctx, &zone_id, &who).await?;
     let zone = p.get_zone(&id, false).await?;
@@ -137,7 +139,7 @@ pub async fn list_records(
     Path(zone_id): Path<String>,
     Query(q): Query<RecordsQuery>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_READ).await?;
     let (p, id) = dns::provider_for(&ctx, &zone_id, &requester(&headers, &svc)?).await?;
     let record_type = q
         .record_type
@@ -180,7 +182,7 @@ pub async fn create_record(
     Path(zone_id): Path<String>,
     ApiJson(input): ApiJson<RecordInput>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let op = Op::new(
         &headers,
         &svc,
@@ -203,7 +205,7 @@ pub async fn update_record(
     Path((zone_id, record_id)): Path<(String, String)>,
     ApiJson(input): ApiJson<RecordInput>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let op = Op::new(
         &headers,
         &svc,
@@ -225,7 +227,7 @@ pub async fn delete_record(
     headers: HeaderMap,
     Path((zone_id, record_id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let op = Op::new(
         &headers,
         &svc,
@@ -249,7 +251,7 @@ pub async fn ensure_record(
     Path(zone_id): Path<String>,
     ApiJson(input): ApiJson<RecordInput>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let op = Op::new(
         &headers,
         &svc,
@@ -274,7 +276,7 @@ pub async fn list_servers(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let all = agents::Model::find_all(&ctx.db).await?;
     let out: Vec<Value> = all
         .iter()
@@ -316,7 +318,7 @@ pub async fn install_server(
     headers: HeaderMap,
     ApiJson(req): ApiJson<InstallServerRequest>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let raw = req
         .agent_id
         .as_deref()

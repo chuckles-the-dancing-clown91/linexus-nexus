@@ -324,17 +324,18 @@ impl BindDns {
         }
         let refs: Vec<&agents::Model> = servers.iter().collect();
         let ns = name_servers(&z.name, &refs);
-        let records = if with_records {
-            Some(
-                z.records(&self.ctx.db)
-                    .await
-                    .map_err(db_err)?
-                    .iter()
-                    .map(record_json)
-                    .collect(),
-            )
+        let (records, record_count) = if with_records {
+            let records: Vec<_> = z
+                .records(&self.ctx.db)
+                .await
+                .map_err(db_err)?
+                .iter()
+                .map(record_json)
+                .collect();
+            let count = records.len() as u64;
+            (Some(records), count)
         } else {
-            None
+            (None, z.record_count(&self.ctx.db).await.map_err(db_err)?)
         };
         Ok(Zone {
             id: format!("{BIND_PREFIX}{}", z.zone_id),
@@ -349,6 +350,7 @@ impl BindDns {
             apply_status: self.apply_status(z).await,
             last_task_id: z.last_task_id.clone().unwrap_or_default(),
             created_at: z.created_at.to_rfc3339(),
+            record_count: Some(record_count),
             records,
             default_ttl: i64::from(z.default_ttl),
         })

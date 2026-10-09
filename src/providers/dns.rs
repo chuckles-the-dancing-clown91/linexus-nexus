@@ -57,6 +57,9 @@ pub struct Zone {
     pub apply_status: String,
     pub last_task_id: String,
     pub created_at: String,
+    /// How many records the zone holds: counted for BIND, `null` for
+    /// Cloudflare (its zone list carries no count).
+    pub record_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub records: Option<Vec<Record>>,
     /// The TTL a record gets when none is given.
@@ -545,6 +548,7 @@ pub fn cf_zone(z: &Value) -> Zone {
         apply_status: String::new(),
         last_task_id: String::new(),
         created_at: s("created_on"),
+        record_count: None,
         records: None,
         default_ttl: AUTO_TTL,
     }
@@ -704,6 +708,7 @@ mod tests {
             apply_status: String::new(),
             last_task_id: String::new(),
             created_at: String::new(),
+            record_count: None,
             records: None,
             default_ttl: if provider == CLOUDFLARE { 1 } else { 3600 },
         }

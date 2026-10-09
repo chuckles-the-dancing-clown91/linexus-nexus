@@ -159,6 +159,85 @@ pub async fn credentials(ctx: &AppContext, key: &str) -> ProviderResult<Option<C
     }))
 }
 
+/// Requester recorded on credentials stored by [`bootstrap_from_env`].
+pub const BOOTSTRAP_REQUESTER: &str = "bootstrap from environment";
+
+/// At start: seal and store the environment's provider tokens for every
+/// provider that has **no stored credentials yet**, exactly as a
+/// `PUT /providers/{key}/credentials` would (with a `credentials.put` row in
+/// the operations log, requester "bootstrap from environment"), so they
+/// survive the variables being removed later. Stored credentials are never
+/// overwritten. Returns the providers it stored.
+pub async fn bootstrap_from_env(ctx: &AppContext) -> Vec<&'static str> {
+    let mut stored = Vec::new();
+    for key in CREDENTIALED {
+        let Some(token) = token_env(key).and_then(env_nonempty) else {
+            continue;
+        };
+        match provider_credentials::Model::find_by_provider(&ctx.db, key).await {
+            Ok(Some(row)) if row.sealed_token.is_some() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(provider = key, error = %e, "credential bootstrap: cannot read stored credentials");
+                continue;
+            }
+        }
+        if token.len() > 4096 || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            tracing::warn!(
+                provider = key,
+                "credential bootstrap: the token in the environment is malformed; not stored"
+            );
+            continue;
+        }
+        let account_id = if key == CLOUDFLARE {
+            env_nonempty("CLOUDFLARE_ACCOUNT_ID").filter(|a| {
+                let ok = a.len() <= 64 && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+                if !ok {
+                    tracing::warn!(
+                        "credential bootstrap: CLOUDFLARE_ACCOUNT_ID is malformed; ignored"
+                    );
+                }
+                ok
+            })
+        } else {
+            None
+        };
+        let sealed = match secrets::seal(&ctx.environment, key, &token) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(provider = key, error = %e, "credential bootstrap: cannot seal; not stored");
+                continue;
+            }
+        };
+        let outcome = provider_credentials::Model::store(&ctx.db, key, sealed, account_id).await;
+        let row = crate::models::provider_operations::NewOperation {
+            provider: key.to_string(),
+            operation: "credentials.put".to_string(),
+            target: key.to_string(),
+            requester: Some(BOOTSTRAP_REQUESTER.to_string()),
+            ok: outcome.is_ok(),
+            error: outcome.as_ref().err().map(|e| format!("internal {e}")),
+            idempotency_key: None,
+            response_status: Some(if outcome.is_ok() { 204 } else { 500 }),
+            response: None,
+        };
+        if let Err(e) = crate::models::provider_operations::Model::record(&ctx.db, row).await {
+            tracing::warn!(provider = key, error = %e, "credential bootstrap: failed to record the operation");
+        }
+        match outcome {
+            Ok(_) => {
+                tracing::info!(
+                    provider = key,
+                    "stored provider credentials from the environment"
+                );
+                stored.push(key);
+            }
+            Err(e) => tracing::warn!(provider = key, error = %e, "credential bootstrap failed"),
+        }
+    }
+    stored
+}
+
 /// Credentials or `NotConfigured`.
 pub async fn require_credentials(ctx: &AppContext, key: &str) -> ProviderResult<Credentials> {
     credentials(ctx, key)

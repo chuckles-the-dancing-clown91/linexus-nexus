@@ -16,6 +16,7 @@ pub mod plans;
 pub mod provider_credentials;
 pub mod provider_operations;
 pub mod roles;
+pub mod sealed_settings;
 pub mod system_tokens;
 pub mod tasks;
 pub mod users;

@@ -11,7 +11,7 @@ use loco_rs::prelude::{get, post, put, AppContext, Routes};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::api::{operator, run_op, ApiError, ApiJson, ApiResult, Op};
+use super::api::{operator, run_op, scope, ApiError, ApiJson, ApiResult, Op};
 use crate::models::{provider_credentials, provider_operations};
 use crate::providers::{
     self, cloudflare::Cloudflare, digitalocean::DigitalOcean, ProviderError, BIND, CLOUDFLARE,
@@ -90,7 +90,7 @@ async fn provider_entry(ctx: &AppContext, key: &'static str) -> ApiResult<Value>
 
 /// `GET /api/v1/providers`.
 pub async fn list(State(ctx): State<AppContext>, headers: HeaderMap) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let mut out = Vec::new();
     for key in CREDENTIALED {
         out.push(provider_entry(&ctx, key).await?);
@@ -125,7 +125,7 @@ pub async fn put_credentials(
     Path(key): Path<String>,
     ApiJson(req): ApiJson<CredentialsRequest>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let key = credentialed_key(&key)?;
     let token = req
         .token
@@ -170,7 +170,7 @@ pub async fn delete_credentials(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<Response> {
-    let svc = operator(&ctx, &headers).await?;
+    let svc = operator(&ctx, &headers, scope::INFRA_WRITE).await?;
     let key = credentialed_key(&key)?;
     let op = Op::new(&headers, &svc, key, "credentials.delete", key)?;
     run_op(&ctx, op, || async {
@@ -328,7 +328,7 @@ pub async fn test(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     if key == BIND {
         return Ok(axum::Json(json!({
             "ok": true, "state": "ok", "accountId": "", "accountName": "",
@@ -375,7 +375,7 @@ pub async fn operations(
     headers: HeaderMap,
     Query(q): Query<OperationsQuery>,
 ) -> ApiResult<Response> {
-    operator(&ctx, &headers).await?;
+    operator(&ctx, &headers, scope::INFRA_READ).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let provider = q
         .provider

@@ -7,6 +7,7 @@
 #![allow(clippy::nursery)]
 
 pub mod app;
+pub mod boot_checks;
 pub mod controllers;
 pub mod data;
 pub mod demiurge;
@@ -18,6 +19,8 @@ pub mod middleware;
 pub mod models;
 pub mod providers;
 pub mod secrets;
+pub mod signing;
 pub mod tasks;
+pub mod tls;
 pub mod views;
 pub mod workers;

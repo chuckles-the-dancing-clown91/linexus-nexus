@@ -51,9 +51,35 @@ pub struct StepResult {
     pub output: String,
     #[serde(default)]
     pub error: String,
+    /// The step's own name when the agent sends one (else its action).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The step's exit code when the agent sends one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
 }
 
 impl StepResult {
+    /// The name shown for the step: its own, else its action, else its id.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        [&self.name, &self.action, &self.id]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .map_or("", String::as_str)
+    }
+
+    /// The exit code shown for the step: as reported, else 0 for a success
+    /// and 1 for a failure; `None` for a step that never ran.
+    #[must_use]
+    pub fn display_exit_code(&self) -> Option<i64> {
+        self.exit_code.or(match self.status.as_str() {
+            "success" => Some(0),
+            "failed" => Some(1),
+            _ => None,
+        })
+    }
+
     /// Apply the per-step size caps.
     #[must_use]
     pub fn capped(mut self) -> Self {

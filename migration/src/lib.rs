@@ -34,6 +34,7 @@ mod m20240101_000025_enrollment_tokens;
 mod m20240101_000026_provider_credentials;
 mod m20240101_000027_dns_zones;
 mod m20240101_000028_provider_operations;
+mod m20240101_000029_sealed_settings;
 
 pub struct Migrator;
 
@@ -69,6 +70,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20240101_000026_provider_credentials::Migration),
             Box::new(m20240101_000027_dns_zones::Migration),
             Box::new(m20240101_000028_provider_operations::Migration),
+            Box::new(m20240101_000029_sealed_settings::Migration),
             // inject-above (do not remove this comment)
         ]
     }

@@ -138,6 +138,15 @@ impl DigitalOcean {
             .ok_or_else(|| ProviderError::Unreachable("digitalocean: no `volume`".into()))
     }
 
+    /// A snapshot by a validated id (a droplet snapshot's number or a volume
+    /// snapshot's UUID).
+    pub async fn snapshot(&self, id: &str) -> ProviderResult<Value> {
+        let body = self.get(&format!("/v2/snapshots/{id}")).await?;
+        body.get("snapshot")
+            .cloned()
+            .ok_or_else(|| ProviderError::Unreachable("digitalocean: no `snapshot`".into()))
+    }
+
     pub async fn load_balancer(&self, id: &uuid::Uuid) -> ProviderResult<Value> {
         let body = self.get(&format!("/v2/load_balancers/{id}")).await?;
         body.get("load_balancer")
@@ -375,6 +384,20 @@ pub fn snapshot_json(sn: &Value) -> Value {
         "sizeGb": sn.get("size_gigabytes").cloned().filter(Value::is_number).unwrap_or(json!(0)),
         "createdAt": s(sn, "/created_at"),
         "regions": arr(sn, "/regions"),
+    })
+}
+
+/// A certificate in `GET /cloud/certificates` (for load-balancer HTTPS
+/// rules): `{id, name, type, dnsNames, notAfter, state}`.
+#[must_use]
+pub fn certificate_json(c: &Value) -> Value {
+    json!({
+        "id": s(c, "/id"),
+        "name": s(c, "/name"),
+        "type": s(c, "/type"),
+        "dnsNames": arr(c, "/dns_names"),
+        "notAfter": opt_time(c, "/not_after"),
+        "state": s(c, "/state"),
     })
 }
 

@@ -1,7 +1,7 @@
 //! Shared plumbing for the `/api/v1` provider surface (`docs/PROVIDERS.md`):
 //! the `{"error": "<code>", "detail": "…"}` error shape, a JSON body extractor
-//! that answers `400 invalid` naming the bad field, operator authentication,
-//! the `X-Requested-By` / `Idempotency-Key` / `X-Confirm` headers, and the
+//! that answers `400 invalid` naming the bad field, operator authentication
+//! and scopes, the `X-Requested-By` / `Idempotency-Key` / `X-Confirm` headers, and the
 //! operations log every provider mutation goes through ([`run_op`]).
 
 use std::collections::HashSet;
@@ -19,7 +19,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use crate::gateway_client;
-use crate::middleware::system_token::{self, SystemContext};
+pub use crate::middleware::system_token::scope;
+use crate::middleware::system_token::{self, Caller, SystemContext};
 use crate::models::provider_operations::{self, NewOperation};
 use crate::providers::ProviderError;
 
@@ -46,6 +47,9 @@ impl ApiError {
     }
     pub fn unauthorized(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", detail)
+    }
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", detail)
     }
     pub fn not_found(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", detail)
@@ -162,9 +166,40 @@ where
     }
 }
 
-/// Authenticate an operator (system key). Agent credentials are refused.
-pub async fn operator(ctx: &AppContext, headers: &HeaderMap) -> ApiResult<SystemContext> {
-    Ok(system_token::authenticate_bearer(ctx, headers).await?)
+/// `403 forbidden` unless `svc` holds `scope`.
+pub fn require_scope(svc: &SystemContext, scope: &str) -> ApiResult<()> {
+    if svc.has_scope(scope) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!("token lacks scope {scope}")))
+    }
+}
+
+/// Authenticate an operator (system key) holding `scope` (see [`scope`]).
+/// Agent credentials are refused (`401`); a key without the scope is `403`.
+pub async fn operator(
+    ctx: &AppContext,
+    headers: &HeaderMap,
+    scope: &str,
+) -> ApiResult<SystemContext> {
+    let svc = system_token::authenticate_bearer(ctx, headers).await?;
+    require_scope(&svc, scope)?;
+    Ok(svc)
+}
+
+/// Authenticate a caller of an agent route about `agent_id`: the agent's own
+/// `nxa_` credential (no scopes apply), or an operator key holding `scope`.
+pub async fn agent_or_operator(
+    ctx: &AppContext,
+    headers: &HeaderMap,
+    agent_id: &uuid::Uuid,
+    scope: &str,
+) -> ApiResult<Caller> {
+    let caller = system_token::authorize_agent(ctx, headers, agent_id).await?;
+    if let Caller::System(svc) = &caller {
+        require_scope(svc, scope)?;
+    }
+    Ok(caller)
 }
 
 fn header_text(headers: &HeaderMap, name: &str, max: usize) -> ApiResult<Option<String>> {
