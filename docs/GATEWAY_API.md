@@ -5,11 +5,21 @@ The surface Daedalus IT (the Hub) and the rmm-agent talk to
 absent it is rendered as an empty string or zero rather than `null`, so the
 Hub's Go structs always decode.
 
+The infrastructure-gateway extension — enrollment tokens and per-agent
+credentials, richer facts, task retry/cancel, providers (DigitalOcean,
+Cloudflare, BIND), DNS, domains, cloud, agent install and the operations log —
+is specified in [PROVIDERS.md](PROVIDERS.md) (including §11, the
+implementation notes).
+
 ## Authentication
 
 Every route takes `Authorization: Bearer <key>`: the root
 `NEXUS_SYSTEM_TOKEN` or a token minted with `POST /api/nexus/tokens`. A missing
-or unknown key is `401`.
+or unknown key is `401`. Agent routes (`report`, `heartbeat`, `tasks`,
+`tasks/{taskId}/result`, `POST logs`, `GET environment`) also accept the
+agent's own `nxa_` credential (returned by enrollment) **for its own id only**;
+operator routes refuse it. `POST /agents/enroll` can instead be authenticated
+by an `enrollmentToken` in the body.
 
 ## Endpoints
 
@@ -17,7 +27,8 @@ or unknown key is `401`.
 |---|---|---|
 | GET | `/agents` | every agent |
 | GET | `/agents/{id}` | one agent with its facts |
-| POST | `/agents/enroll` | `{hostname, hostgroup?}` → a new agent |
+| GET | `/agents/{id}/services` · `/agents/{id}/packages` | the last reported services / packages |
+| POST | `/agents/enroll` | `{hostname, hostgroup?, machineId?, enrollmentToken?}` → `201` agent + `agentToken` |
 | POST | `/agents/{id}/report` | facts; counts as a heartbeat |
 | POST | `/agents/{id}/heartbeat` | heartbeat |
 | GET/POST | `/agents/{id}/environment` | `{environment, monitored, note}` |
@@ -27,6 +38,27 @@ or unknown key is `401`.
 | POST | `/agents/{id}/tasks/{taskId}/result` | the agent reports a task's result — see below |
 | POST | `/tasks` | `{intent, targets, requesterId?, autoRollback?, params?}` → `{taskId, status}` |
 | GET | `/tasks/{id}` | one task's lifecycle and result — see below |
+| POST | `/tasks/{id}/cancel` | cancel an unfinished task → `{taskId, status: "cancelled"}` (`409` when finished) |
+
+`targets` may contain `hostgroup:<name>`, expanded to every agent of that
+hostgroup when the task is created.
+
+### Provider surface (see [PROVIDERS.md](PROVIDERS.md))
+
+| Method | Path |
+|---|---|
+| GET/POST | `/enrollment-tokens` · GET/DELETE `/enrollment-tokens/{id}` |
+| GET | `/providers` · PUT/DELETE `/providers/{key}/credentials` · POST `/providers/{key}/test` |
+| GET/POST | `/dns/zones` · GET/DELETE `/dns/zones/{zoneId}` |
+| GET/POST | `/dns/zones/{zoneId}/records` · PATCH/DELETE `/dns/zones/{zoneId}/records/{recordId}` · POST `/dns/zones/{zoneId}/records/ensure` |
+| GET/POST | `/dns/servers` |
+| GET | `/domains` · GET/PATCH `/domains/{name}` |
+| GET | `/cloud/account` · `/cloud/catalog` · `/cloud/actions/{id}` · `/cloud/firewalls` · `/cloud/vpcs` |
+| GET/POST | `/cloud/droplets` · GET/DELETE `/cloud/droplets/{id}` · POST `/cloud/droplets/{id}/actions` · GET `/cloud/droplets/{id}/snapshots` |
+| GET/POST | `/cloud/volumes` · DELETE `/cloud/volumes/{id}` · POST `/cloud/volumes/{id}/actions` · POST `/cloud/volumes/{id}/mount` |
+| GET/POST | `/cloud/load-balancers` · GET/PUT/DELETE `/cloud/load-balancers/{id}` · POST/DELETE `/cloud/load-balancers/{id}/droplets` |
+| GET | `/operations?provider=&limit=` |
+| GET | `/install/agent.sh` · `/install/rmm-agent-linux-{amd64,arm64}` (public, outside `/api/v1`) |
 
 ## Task lifecycle
 
@@ -35,16 +67,15 @@ or unknown key is `401`.
 | Status | Meaning |
 |---|---|
 | `pending` | only for an instant while `POST /tasks` creates the row (and on tasks made through the operator API `/api/tasks`) |
-| `accepted` | recorded, but the Orchestrator could not plan it; no agent will pick it up |
+| `accepted` | recorded, but the Orchestrator could not plan it; re-planned when a target agent polls and by a 60 s sweep, for up to 24 h (then `failed`, `result.error = "never planned"`) |
 | `planned` | the Orchestrator returned a plan; waiting for the agent to poll |
 | `dispatched` | an agent has been handed the plan |
 | `completed` | the agent reported `success` |
 | `failed` | the agent reported anything else |
-| `cancelled` | cancelled through the operator API |
+| `cancelled` | cancelled (`POST /tasks/{id}/cancel`, the operator API, or superseded by a newer BIND zone apply); never handed to an agent |
 
 `completed`, `failed` and `cancelled` are terminal. A caller following a task
-polls `GET /tasks/{id}` until `status` is one of them (an `accepted` task never
-moves on by itself).
+polls `GET /tasks/{id}` until `status` is one of them.
 
 ## `GET /api/v1/tasks/{id}`
 
