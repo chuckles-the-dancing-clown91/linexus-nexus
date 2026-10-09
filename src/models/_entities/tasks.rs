@@ -38,6 +38,10 @@ pub struct Model {
     /// Per-step results (JSON array of `{id, action, status, changed, output, error}`).
     #[sea_orm(column_type = "Text", nullable)]
     pub steps: Option<String>,
+    /// The body sent to the Orchestrator's `POST /plan`, kept so an
+    /// `accepted` (unplanned) task can be re-planned exactly as asked.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub plan_request: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

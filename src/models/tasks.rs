@@ -51,9 +51,35 @@ pub struct StepResult {
     pub output: String,
     #[serde(default)]
     pub error: String,
+    /// The step's own name when the agent sends one (else its action).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The step's exit code when the agent sends one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
 }
 
 impl StepResult {
+    /// The name shown for the step: its own, else its action, else its id.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        [&self.name, &self.action, &self.id]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .map_or("", String::as_str)
+    }
+
+    /// The exit code shown for the step: as reported, else 0 for a success
+    /// and 1 for a failure; `None` for a step that never ran.
+    #[must_use]
+    pub fn display_exit_code(&self) -> Option<i64> {
+        self.exit_code.or(match self.status.as_str() {
+            "success" => Some(0),
+            "failed" => Some(1),
+            _ => None,
+        })
+    }
+
     /// Apply the per-step size caps.
     #[must_use]
     pub fn capped(mut self) -> Self {
@@ -164,8 +190,10 @@ impl Model {
         db: &DatabaseConnection,
         agent_id: &str,
     ) -> ModelResult<Vec<Self>> {
+        use sea_orm::QueryOrder;
         let candidates = tasks::Entity::find()
             .filter(tasks::Column::Status.is_in(["planned", "dispatched"]))
+            .order_by_asc(tasks::Column::Id)
             .all(db)
             .await?;
         Ok(candidates
@@ -175,15 +203,96 @@ impl Model {
     }
 
     /// Transition a freshly planned task to `dispatched` once an agent has been
-    /// handed the plan. Idempotent: only `planned` tasks move.
+    /// handed the plan. Idempotent: only `planned` tasks move, and the move is
+    /// a conditional update, so a task cancelled meanwhile stays cancelled.
     pub async fn mark_dispatched(self, db: &DatabaseConnection) -> ModelResult<Self> {
         if self.status != "planned" {
             return Ok(self);
         }
+        Self::transition(db, &self.task_id, &["planned"], "dispatched", None).await?;
+        Self::find_by_task_id(db, &self.task_id).await
+    }
+
+    /// Move a task to `to` only if its status is still one of `from`
+    /// (optionally storing a plan). Returns whether it moved. This is the one
+    /// way concurrent paths (agent poll, sweep, cancel) change a task's status
+    /// without overwriting each other.
+    pub async fn transition(
+        db: &DatabaseConnection,
+        task_id: &Uuid,
+        from: &[&str],
+        to: &str,
+        plan_json: Option<&str>,
+    ) -> ModelResult<bool> {
+        use sea_orm::sea_query::Expr;
+        let now: DateTimeWithTimeZone = chrono::Local::now().into();
+        let mut q = tasks::Entity::update_many()
+            .col_expr(tasks::Column::Status, Expr::value(to))
+            .col_expr(tasks::Column::UpdatedAt, Expr::value(now));
+        if let Some(plan) = plan_json {
+            q = q.col_expr(tasks::Column::Plan, Expr::value(plan));
+        }
+        if matches!(to, "completed" | "failed" | "cancelled") {
+            q = q.col_expr(tasks::Column::CompletedAt, Expr::value(now));
+        }
+        let res = q
+            .filter(tasks::Column::TaskId.eq(*task_id))
+            .filter(tasks::Column::Status.is_in(from.iter().copied()))
+            .exec(db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Store the Orchestrator request body used to plan this task.
+    pub async fn set_plan_request(self, db: &DatabaseConnection, body: &str) -> ModelResult<Self> {
         let mut active: tasks::ActiveModel = self.into();
-        active.status = ActiveValue::set("dispatched".to_string());
-        active.updated_at = ActiveValue::set(chrono::Local::now().into());
+        active.plan_request = ActiveValue::set(Some(body.to_string()));
         Ok(active.update(db).await?)
+    }
+
+    /// Tasks still `accepted` (the Orchestrator could not plan them), oldest first.
+    pub async fn find_accepted(db: &DatabaseConnection) -> ModelResult<Vec<Self>> {
+        use sea_orm::QueryOrder;
+        Ok(tasks::Entity::find()
+            .filter(tasks::Column::Status.eq("accepted"))
+            .order_by_asc(tasks::Column::Id)
+            .all(db)
+            .await?)
+    }
+
+    /// Give up on an `accepted` task: `failed` with `result.error = "never
+    /// planned"`. Conditional, so a task planned meanwhile is left alone.
+    pub async fn fail_never_planned(db: &DatabaseConnection, task_id: &Uuid) -> ModelResult<bool> {
+        use sea_orm::sea_query::Expr;
+        let now: DateTimeWithTimeZone = chrono::Local::now().into();
+        let res = tasks::Entity::update_many()
+            .col_expr(tasks::Column::Status, Expr::value("failed"))
+            .col_expr(tasks::Column::UpdatedAt, Expr::value(now))
+            .col_expr(tasks::Column::CompletedAt, Expr::value(now))
+            .col_expr(tasks::Column::ResultStatus, Expr::value("failed"))
+            .col_expr(tasks::Column::ErrorMessage, Expr::value("never planned"))
+            .col_expr(
+                tasks::Column::ResultMessage,
+                Expr::value("the Orchestrator could not be reached to plan this task"),
+            )
+            .col_expr(tasks::Column::ExitCode, Expr::value(1_i64))
+            .filter(tasks::Column::TaskId.eq(*task_id))
+            .filter(tasks::Column::Status.eq("accepted"))
+            .exec(db)
+            .await?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Whether this task targets `agent_id`.
+    #[must_use]
+    pub fn targets_agent(&self, agent_id: &str) -> bool {
+        task_targets_agent(self, agent_id)
+    }
+
+    /// Whether the status is terminal.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
     }
 
     /// Record a terminal result reported by the agent: set `completed`/`failed`,

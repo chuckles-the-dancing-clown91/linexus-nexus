@@ -1,7 +1,14 @@
 pub mod agents;
+pub mod api;
 pub mod auth;
+pub mod cloud;
+pub mod dns;
+pub mod domains;
+pub mod enrollment;
 pub mod gateway;
 pub mod housing;
+pub mod install;
 pub mod nexus;
+pub mod providers;
 pub mod roles;
 pub mod tasks;

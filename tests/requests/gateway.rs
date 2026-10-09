@@ -137,7 +137,8 @@ async fn get_task_follows_lifecycle_to_result_with_steps() {
                 { "id": "s1", "action": "file.write", "status": "success",
                   "changed": true, "output": "written", "error": "" },
                 { "id": "s2", "action": "command.run", "status": "failed",
-                  "changed": true, "output": "boom", "error": "exit status 3" },
+                  "changed": true, "output": "boom", "error": "exit status 3",
+                  "name": "run the deploy hook", "exitCode": 3 },
                 { "id": "s3", "action": "service.ensure", "status": "skipped" },
             ],
         });
@@ -158,12 +159,17 @@ async fn get_task_follows_lifecycle_to_result_with_steps() {
         assert_eq!(result["output"], report["output"]);
         assert_eq!(
             result["steps"],
+            // `name` is the step's own (else its action) and `exitCode` as
+            // reported (else 0 / 1 from the status; null when it never ran).
             json!([
-                { "id": "s1", "action": "file.write", "status": "success",
+                { "id": "s1", "name": "file.write", "action": "file.write",
+                  "status": "success", "exitCode": 0,
                   "changed": true, "output": "written", "error": "" },
-                { "id": "s2", "action": "command.run", "status": "failed",
+                { "id": "s2", "name": "run the deploy hook", "action": "command.run",
+                  "status": "failed", "exitCode": 3,
                   "changed": true, "output": "boom", "error": "exit status 3" },
-                { "id": "s3", "action": "service.ensure", "status": "skipped",
+                { "id": "s3", "name": "service.ensure", "action": "service.ensure",
+                  "status": "skipped", "exitCode": null,
                   "changed": false, "output": "", "error": "" },
             ])
         );

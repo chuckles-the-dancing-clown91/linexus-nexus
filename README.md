@@ -55,6 +55,11 @@ tails, task dispatch, and following a task to completion with
 `GET /api/v1/tasks/{id}` (lifecycle `status`, plus the agent's result: exit
 code, capped output and per-step results). Bearer-token auth. Routes, task
 statuses and the result body are in [docs/GATEWAY_API.md](docs/GATEWAY_API.md).
+It is also the infrastructure gateway — enrollment tokens, DigitalOcean,
+Cloudflare DNS/Registrar and agent-hosted BIND — per
+[docs/PROVIDERS.md](docs/PROVIDERS.md) (set `NEXUS_SECRET_KEY` to store
+provider credentials, `NEXUS_PUBLIC_URL` for droplet enrollment and
+`LINEXUS_AGENT_BINARY_DIR` for `/install/rmm-agent-linux-<arch>`).
 
 ## Full Stack Serving
 

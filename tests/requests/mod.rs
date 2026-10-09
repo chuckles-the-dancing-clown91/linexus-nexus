@@ -1,5 +1,9 @@
 mod auth;
+mod enrollment;
 mod gateway;
+mod hardening;
 mod housing;
 mod nexus;
 mod prepare_data;
+mod providers;
+mod stub;
