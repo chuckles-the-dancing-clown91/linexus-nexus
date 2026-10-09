@@ -398,6 +398,9 @@ pub fn same_content(record_type: &str, a: &str, b: &str) -> bool {
 }
 
 /// The DNS provider behind a zone id.
+// `async_trait` marks each boxed future `#[must_use]`, which a future already
+// is; newer Clippy reports that on every method of a trait it declares.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DnsProvider: Send + Sync {
     /// Every zone this provider holds.
