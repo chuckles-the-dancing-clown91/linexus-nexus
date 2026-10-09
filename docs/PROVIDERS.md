@@ -8,13 +8,15 @@ holds the write credentials. The Hub never talks to DigitalOcean or Cloudflare w
 write-capable token — Nexus does, from behind the firewall.
 
 Everything here is under `/api/v1`, JSON camelCase, `Authorization: Bearer <key>`
-(the root `NEXUS_SYSTEM_TOKEN` or a minted system token) unless a route says
-otherwise. Errors are `{"error": "<code>", "detail": "…"}` with:
+(the root `NEXUS_SYSTEM_TOKEN` or a minted system token holding the route's
+scope, see *Scopes* below) unless a route says otherwise. Errors are
+`{"error": "<code>", "detail": "…"}` with:
 
 | Status | `error` | When |
 |---|---|---|
 | 400 | `invalid` | a missing or malformed field — `detail` names it |
-| 401 | `unauthorized` | no key, a wrong key, an agent credential on someone else's route |
+| 401 | `unauthorized` | no key, a wrong key, an agent credential on someone else's route, an operator without the required client certificate (§11) |
+| 403 | `forbidden` | a minted key without the route's scope: `detail` is `token lacks scope <scope>` |
 | 404 | `not_found` | no such agent / task / zone / record / droplet |
 | 409 | `conflict` | already exists (zone name, record that cannot coexist), a `machineId` enrolled in another hostgroup (token path), an `Idempotency-Key` reused for another operation or still in flight, cancelling a finished task |
 | 412 | `confirmation_required` | a destructive call without the matching `X-Confirm` header |
@@ -22,6 +24,25 @@ otherwise. Errors are `{"error": "<code>", "detail": "…"}` with:
 | 424 | `provider_not_configured` | the provider has no credentials |
 | 502 | `provider_unreachable` | the provider timed out / 5xx / bad body |
 | 500 | `internal` | a Nexus fault; the cause is in the Nexus log, never in `detail` |
+
+**Scopes.** Operator keys minted with `POST /api/nexus/tokens` (`scopes`:
+comma-separated) are checked per route; `*` grants every scope and
+`prefix:*` every scope under it (`infra:*`). The root `NEXUS_SYSTEM_TOKEN`
+holds all of them. Agent `nxa_` credentials are not scoped: they keep their
+narrow access to their own agent routes.
+
+| Scope | Routes |
+|---|---|
+| `agents:read` | `GET /agents`, `/agents/{id}`, `/services`, `/packages`, `GET /agents/{id}/logs`, `GET /agents/{id}/environment` (with a system key) |
+| `agents:write` | `POST /agents/enroll` with a system key (adopt), `POST /agents/{id}/environment`; with a system key: `report`, `heartbeat`, `POST /agents/{id}/logs` |
+| `tasks:read` | `GET /tasks/{id}`; `GET /agents/{id}/tasks` with a system key |
+| `tasks:write` | `POST /tasks`, `POST /tasks/{id}/cancel`; `POST /agents/{id}/tasks/{t}/result` with a system key |
+| `infra:read` | every `GET` under `/providers`, `/dns`, `/domains`, `/cloud`, `/operations`, and `POST /providers/{key}/test` |
+| `infra:write` | provider credentials, and every DNS / domain / cloud mutation (incl. `/cloud/volumes/{id}/mount`, `POST /dns/servers`) |
+| `enroll` | `/enrollment-tokens` (mint, list, read, revoke); also needed by `POST /cloud/droplets` with `enrollAgent` |
+
+`GET /signing-key` is public. A token minted with only the Demiurge publisher
+defaults has no `/api/v1` scope.
 
 Every **mutating** provider call takes an optional `X-Requested-By` header (the
 Hub sends `user:<uuid> <email>`) that is recorded on the operation and shipped to
@@ -52,8 +73,9 @@ the token back and learns the new agent id.
 - With an enrollment token, its `hostgroup` and `environment` win over the body.
 - `machineId` (from `/etc/machine-id`) **re-adopts**: an existing agent with the same
   machine id keeps its agent id; its credential is rotated. Without one, a new row.
-- → `201 {agentId, id, hostname, hostgroup, environment, agentToken: "nxa_…", enrollmentTokenId, metadata, readopted: bool}`.
-  The agent keeps `agentToken` and uses it for every later call.
+- → `201 {agentId, id, hostname, hostgroup, environment, agentToken: "nxa_…", enrollmentTokenId, metadata, readopted: bool, signingKey: {alg, keyId, publicKey}}`.
+  The agent keeps `agentToken` and uses it for every later call, and pins
+  `signingKey` unless it was installed with one (§12).
 
 Agent routes (`/agents/{id}/report`, `/heartbeat`, `/tasks`, `/tasks/{t}/result`,
 `POST /agents/{id}/logs`, `GET /agents/{id}/environment`) accept the agent's own
@@ -113,7 +135,7 @@ Zone ids are prefixed by provider: `cf:<cloudflare zone id>` or `bind:<uuid>`.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/dns/zones` | every zone of every configured provider: `[{id, provider, name, status, nameServers, originalNameServers, primaryAgentId, secondaryAgentIds, serial, applyStatus, lastTaskId, createdAt}]` |
+| GET | `/dns/zones` | every zone of every configured provider: `[{id, provider, name, status, nameServers, originalNameServers, primaryAgentId, secondaryAgentIds, serial, applyStatus, lastTaskId, createdAt, recordCount}]` — `recordCount` is a number for BIND and `null` for Cloudflare |
 | POST | `/dns/zones` | `{provider*: "cloudflare"|"bind", name*, primaryAgentId? (bind, required), secondaryAgentIds?, defaultTtl?=3600, adminEmail?}` → `201` zone. Cloudflare answers with the **name servers to set at the registrar** |
 | GET | `/dns/zones/{zoneId}` | the zone with `records` |
 | DELETE | `/dns/zones/{zoneId}` | needs `X-Confirm: <zone name>` → `204` |
@@ -162,6 +184,7 @@ name servers) it is managed here.
 | POST | `/cloud/droplets` | `{name*, region*, size*, image*, tags?, vpcUuid?, sshKeys?, backups?, monitoring?=true, ipv6?, userData?, enrollAgent?: {hostgroup*, environment?, metadata?}}` → `201 {droplet, enrollmentTokenId?}` |
 | POST | `/cloud/droplets/{id}/actions` | `{type*: power_on|power_off|shutdown|reboot|power_cycle|resize|snapshot|rebuild|rename|enable_backups|disable_backups, size?, disk?, name?, image?}` → `{action}` |
 | GET | `/cloud/droplets/{id}/snapshots` | `[{id, name, sizeGb, createdAt, regions}]` |
+| DELETE | `/cloud/snapshots/{id}` | a droplet snapshot (numeric id) or volume snapshot (UUID); needs `X-Confirm: <snapshot name>` → `204` |
 | DELETE | `/cloud/droplets/{id}` | needs `X-Confirm: <droplet name>` → `204` |
 | GET | `/cloud/actions/{id}` | `{id, type, status: in-progress|completed|errored, startedAt, completedAt, resourceId, resourceType}` |
 | GET | `/cloud/volumes` | `[Volume]` |
@@ -177,6 +200,7 @@ name servers) it is managed here.
 | DELETE | `/cloud/load-balancers/{id}/droplets` | `{dropletIds*}` → `204` |
 | DELETE | `/cloud/load-balancers/{id}` | needs `X-Confirm: <lb name>` → `204` |
 | GET | `/cloud/firewalls` · `/cloud/vpcs` | read-only lists |
+| GET | `/cloud/certificates` | `[{id, name, type, dnsNames, notAfter, state}]` — for `forwardingRules[].certificateId` |
 
 **Droplet** = `{id, name, status, region, size, image, memoryMb, vcpus, diskGb,
 publicIpv4, privateIpv4, ipv6, vpcUuid, tags, volumeIds, features, priceMonthly,
@@ -202,8 +226,18 @@ A caller-supplied `userData` runs after it. The droplet is tagged
 `GET /install/agent.sh` (public) — a POSIX script that downloads the agent for the
 machine's architecture from `$NEXUS_PUBLIC_URL/install/rmm-agent-linux-<arch>` (served
 from `LINEXUS_AGENT_BINARY_DIR`), writes `/etc/linexus/agent.env`
-(`NEXUS_URL`, `ENROLLMENT_TOKEN`, `AGENT_STATE_FILE=/var/lib/linexus/agent-state.json`),
+(`NEXUS_URL`, `ENROLLMENT_TOKEN`, `AGENT_STATE_FILE=/var/lib/linexus/agent-state.json`,
+`LINEXUS_SIGNING_PUBKEY` and, with a CA, `LINEXUS_CA_FILE`),
 installs `linexus-agent.service` and starts it. Idempotent.
+
+Optional inputs: `NEXUS_CA_PEM` (PEM text) or `NEXUS_CA_FILE` (a path) — the
+CA that signed Nexus's certificate, saved to `/etc/linexus/nexus-ca.pem`, used
+for the binary download and written as `LINEXUS_CA_FILE`; `NEXUS_SIGNING_PUBKEY`
+— the plan key to pin, written as `LINEXUS_SIGNING_PUBKEY`. Its default is
+Nexus's current public key, **embedded when the script is served**, so a
+`curl … | sh` install pins it with no extra step. The agent's own names
+(`LINEXUS_CA_PEM`, `LINEXUS_CA_FILE`, `LINEXUS_SIGNING_PUBKEY`) are accepted as
+well; the `NEXUS_*` ones win, and empty values count as unset.
 
 ## 9. Operations log
 
@@ -321,6 +355,96 @@ anything else is `404`.
 target, requester, status, error, idempotencyKey, createdAt}` (`limit`
 1…500). Operations: `credentials.put|delete`, `zone.create|delete`,
 `record.create|update|delete|ensure`, `server.install`, `domain.update`,
-`droplet.create|action|delete`, `volume.create|action|mount|delete`,
+`droplet.create|action|delete`, `snapshot.delete`,
+`volume.create|action|mount|delete`,
 `load_balancer.create|update|add_droplets|remove_droplets|delete`.
+Credentials stored from the environment at start (below) are a
+`credentials.put` with requester `bootstrap from environment`.
 
+**Scopes (§ top).** A missing scope is `403` before anything else is
+looked at (so an unknown id answers `403`, not `404`, to a key without the
+scope). A droplet with `enrollAgent` needs `infra:write` **and** `enroll`.
+Error bodies on every `/api/v1` route, the agent routes included, are now
+`{"error", "detail"}`.
+
+**Tasks (`GET /tasks/{id}`).** `result.steps[]` is `{id, name, action,
+status, exitCode, changed, output, error}` in plan order: `name` is the
+step's own name when the agent sends one, else its action; `exitCode` is the
+step's as reported, else `0` for `success`, `1` for `failed` and `null` for a
+step that never ran (`skipped`).
+
+**Provider bootstrap.** At start, a provider with **no stored credentials**
+and a token in the environment (`DIGITALOCEAN_TOKEN`; `CLOUDFLARE_API_TOKEN`
+with optional `CLOUDFLARE_ACCOUNT_ID`) gets that token sealed and stored as
+if `PUT` through the API. Stored credentials are never overwritten.
+
+**Signed plans (§12).** Every task in `GET /agents/{id}/tasks` carries an
+`envelope`; nothing else about the task changed. The envelope is produced at
+delivery: each poll signs afresh (new `issuedAt`, `expiresAt`, `nonce`).
+
+**TLS and operator certificates.** With `NEXUS_TLS_CERT` + `NEXUS_TLS_KEY`
+Nexus serves HTTPS itself on its usual port (`PORT`, default 5150);
+`NEXUS_TLS_CLIENT_CA` makes it request a client certificate and verify any
+that is presented (presenting one stays optional: agents carry none). With
+`NEXUS_REQUIRE_OPERATOR_CERT=1`, a `/api/v1` request whose bearer is an
+operator key (not an `nxa_` / `nxe_` token) without a verified client
+certificate is `401` with `detail` "operator requests must present a client
+certificate signed by NEXUS_TLS_CLIENT_CA". Production refuses to start with
+the rule on and no client CA.
+
+**Production.** `LOCO_ENV=production` refuses to start unless
+`NEXUS_SYSTEM_TOKEN`, `NEXUS_SECRET_KEY` and `NEXUS_JWT_SECRET` are each at
+least 32 characters and not a development value; it warns when
+`NEXUS_PUBLIC_URL` is not `https://`. The development root token, the
+development sealing key and the seeded admin exist only in development / test.
+Everywhere, an empty environment variable counts as unset.
+
+## 12. Signed plans
+
+Nexus signs every plan it hands an agent with Ed25519; the agent executes a
+plan only from a verified envelope.
+
+**Key.** `NEXUS_SIGNING_KEY` = standard (padded) base64 of the 32-byte Ed25519
+seed. Unset: Nexus generates one on first start and keeps it sealed under
+`NEXUS_SECRET_KEY` in its database, reusing it on later starts (production
+logs a loud warning when it generates one). Set and different from the stored
+key: the variable wins and replaces it (rotation — agents that pinned the old
+key must be re-pinned). `keyId` = the first 16 hex characters of SHA-256 over
+the 32-byte public key.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/signing-key` | public → `{"alg": "ed25519", "keyId": "…", "publicKey": "<base64, 32 bytes>"}` |
+
+The same object is `signingKey` in the enrollment `201` (§1), on both the
+token and the system-key path, and the installer embeds `publicKey` (§8).
+
+**Envelope.** Each task in `GET /agents/{id}/tasks` keeps all its fields
+(`taskId, intent, status, autoRollback, plan`) and gains:
+
+```json
+"envelope": {
+  "alg": "ed25519",
+  "keyId": "…",
+  "payload": "<base64 of the payload bytes>",
+  "signature": "<base64 of the 64-byte signature over exactly those bytes>"
+}
+```
+
+The payload is a UTF-8 JSON object with exactly these keys:
+
+```json
+{"v": 1, "taskId": "<uuid>", "agentId": "<this agent's id>", "intent": "…",
+ "plan": <the task's plan, exactly as delivered beside it>,
+ "issuedAt": "<RFC 3339 UTC>", "expiresAt": "<RFC 3339 UTC>",
+ "nonce": "<16 random bytes, hex>"}
+```
+
+`expiresAt` = `issuedAt` + `NEXUS_PLAN_TTL_SECS` (default **3600**). Plans are
+signed at delivery — every poll re-signs — so the TTL only bounds the time
+from delivery to execution, and it is kept short because the agent remembers
+the last 1000 executed task ids for replay protection: an hour keeps that
+window safely covered. The agent verifies the signature over the raw decoded
+payload bytes, checks `agentId` is its own, that `expiresAt` has not passed
+and that `taskId` was not already executed, and executes **only**
+`payload.plan` (never the unsigned `plan` beside it).
