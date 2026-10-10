@@ -19,6 +19,9 @@ use linexus_nexus::middleware::system_token;
 use serde_json::{json, Value};
 
 pub const CF_TOKEN: &str = "cf-test-token-5f1e2d3c4b5a";
+/// An account-owned token: valid for zones, but `/user/tokens/verify` does not
+/// know it and it may not list `/accounts` (it has no Account Settings: Read).
+pub const CF_ACCT_TOKEN: &str = "cf-acct-token-9a8b7c6d5e4f";
 pub const DO_TOKEN: &str = "dop_v1_0123456789abcdef0123456789abcdef";
 
 /// Sets environment variables; restores the previous values on drop.
@@ -238,15 +241,40 @@ async fn handle(
         }
 
         // ---------------------------------------------------------- Cloudflare
-        (_, ["cf", ..]) if auth != format!("Bearer {CF_TOKEN}") => {
+        (_, ["cf", ..])
+            if auth != format!("Bearer {CF_TOKEN}") && auth != format!("Bearer {CF_ACCT_TOKEN}") =>
+        {
             cf_err(StatusCode::FORBIDDEN, 9109, "Invalid access token")
+        }
+        ("GET", ["cf", "user", "tokens", "verify"]) if auth == format!("Bearer {CF_ACCT_TOKEN}") => {
+            cf_err(StatusCode::UNAUTHORIZED, 1000, "Invalid API Token")
+        }
+        ("GET", ["cf", "accounts"]) if auth == format!("Bearer {CF_ACCT_TOKEN}") => {
+            cf_err(StatusCode::FORBIDDEN, 9109, "Unauthorized to access requested resource")
+        }
+        ("GET", ["cf", "accounts", "acc1", "tokens", "verify"]) => {
+            cf_ok(json!({"id": "tok", "status": "active"}))
         }
         ("GET", ["cf", "user", "tokens", "verify"]) => {
             cf_ok(json!({"id": "tok", "status": "active"}))
         }
         ("GET", ["cf", "accounts"]) => cf_ok(json!([{"id": "acc1", "name": "Acme Hosting"}])),
-        ("GET", ["cf", "zones"]) => cf_ok(Value::Array(s.zones.clone())),
+        ("GET", ["cf", "zones"]) => match query_param(&query, "account.id") {
+            Some(a) if a != "acc1" => cf_err(
+                StatusCode::BAD_REQUEST,
+                70503,
+                "account with given Tag doesn't exist",
+            ),
+            _ => cf_ok(Value::Array(s.zones.clone())),
+        },
         ("POST", ["cf", "zones"]) => {
+            if body["account"]["id"].as_str().is_some_and(|a| a != "acc1") {
+                return cf_err(
+                    StatusCode::BAD_REQUEST,
+                    70503,
+                    "account with given Tag doesn't exist",
+                );
+            }
             let name = body["name"].as_str().unwrap_or_default().to_string();
             if name == "leak.example.com" {
                 // A provider that echoes the credential back in its error.

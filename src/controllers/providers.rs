@@ -118,7 +118,11 @@ pub struct CredentialsRequest {
     pub account_id: Option<String>,
 }
 
-/// `PUT /api/v1/providers/{key}/credentials` → `204`.
+/// `PUT /api/v1/providers/{key}/credentials` → `204`. With a `token`, the
+/// token (and the account id as sent, blank = none) replace what is stored.
+/// Without one, only the account id changes — blank clears it — and a token
+/// must already be stored; so a wrong account id is fixed without pasting
+/// the token again.
 pub async fn put_credentials(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -132,12 +136,13 @@ pub async fn put_credentials(
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| ApiError::invalid("token: required"))?
-        .to_string();
-    if token.len() > 4096 || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(ApiError::invalid(
-            "token: at most 4096 characters, no whitespace",
-        ));
+        .map(ToString::to_string);
+    if let Some(t) = &token {
+        if t.len() > 4096 || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ApiError::invalid(
+                "token: at most 4096 characters, no whitespace",
+            ));
+        }
     }
     let account_id = match req.account_id.as_deref().map(str::trim) {
         Some(a) if !a.is_empty() => {
@@ -147,6 +152,23 @@ pub async fn put_credentials(
             Some(a.to_string())
         }
         _ => None,
+    };
+    let Some(token) = token else {
+        // Only the account id. The token stays as it is — there has to be one.
+        let stored = provider_credentials::Model::find_by_provider(&ctx.db, key)
+            .await?
+            .is_some_and(|r| r.sealed_token.is_some());
+        if !stored {
+            return Err(ApiError::invalid(
+                "token: required (no token is stored for this provider yet)",
+            ));
+        }
+        let op = Op::new(&headers, &svc, key, "credentials.account", key)?;
+        return run_op(&ctx, op, || async {
+            provider_credentials::Model::set_account(&ctx.db, key, account_id).await?;
+            Ok((StatusCode::NO_CONTENT, Value::Null))
+        })
+        .await;
     };
     if !secrets::key_available(&ctx.environment) {
         return Err(ApiError::invalid(format!(
@@ -235,8 +257,40 @@ async fn test_cloudflare(
     cf: &Cloudflare,
     configured_account: Option<&str>,
 ) -> (provider_credentials::Status, Option<Value>) {
+    // `/user/tokens/verify` only knows user-owned tokens. An account-owned token
+    // (Manage Account → API Tokens) is verified at `/accounts/{id}/tokens/verify`,
+    // and either kind that merely works is proved by reading a zone. A valid
+    // token is never reported "unauthorized" for lacking one of those.
+    let mut how = String::new();
     let verify = match cf.verify_token().await {
         Ok(v) => v,
+        Err(
+            e @ ProviderError::Rejected {
+                status: 400 | 401 | 403,
+                ..
+            },
+        ) => {
+            let via_account = match configured_account {
+                Some(id) => cf.verify_account_token(id).await.ok(),
+                None => None,
+            };
+            if let Some(v) = via_account {
+                v
+            } else {
+                match cf.probe().await {
+                    Ok(zones) => {
+                        how = format!(
+                            "the token works (it reads {} zone{}); it is not a user token, so Cloudflare's verify call does not apply",
+                            zones.len(),
+                            if zones.len() == 1 { "" } else { "s" }
+                        );
+                        json!({"status": "active"})
+                    }
+                    // Neither worked: report the first, original refusal.
+                    Err(_) => return (failure_status(&e), None),
+                }
+            }
+        }
         Err(e) => return (failure_status(&e), None),
     };
     let token_status = verify
@@ -260,6 +314,29 @@ async fn test_cloudflare(
     }
     let accounts = match cf.accounts().await {
         Ok(a) => a,
+        // A token without "Account Settings: Read" cannot list accounts. It is
+        // still a working token; say what could not be checked.
+        Err(ProviderError::Rejected {
+            status: 401 | 403, ..
+        }) => {
+            let mut scopes = scopes;
+            scopes["accounts"] = Value::Null;
+            let mut detail =
+                "the token works but cannot list accounts (no Account Settings: Read), so the account id could not be checked"
+                    .to_string();
+            if !how.is_empty() {
+                detail = format!("{how}; {detail}");
+            }
+            return (
+                provider_credentials::Status {
+                    state: "ok".into(),
+                    detail,
+                    account_id: configured_account.map(ToString::to_string),
+                    account_name: None,
+                },
+                Some(scopes),
+            );
+        }
         Err(e) => return (failure_status(&e), Some(scopes)),
     };
     let pick = |a: &Value| {

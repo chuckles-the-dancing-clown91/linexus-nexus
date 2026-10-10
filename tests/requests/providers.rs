@@ -10,7 +10,7 @@ use loco_rs::{testing::prelude::*, TestServer};
 use serde_json::{json, Value};
 use serial_test::serial;
 
-use super::stub::{bearer, header, Env, Stub, CF_TOKEN, DO_TOKEN};
+use super::stub::{bearer, header, Env, Stub, CF_ACCT_TOKEN, CF_TOKEN, DO_TOKEN};
 
 struct Call<'a> {
     request: &'a TestServer,
@@ -917,6 +917,143 @@ async fn install_script_and_binaries_are_public() {
         assert_eq!(request.get("/install/other").await.status_code(), 404);
         std::env::remove_var("LINEXUS_AGENT_BINARY_DIR");
         let _ = std::fs::remove_dir_all(dir);
+    })
+    .await;
+}
+
+/// A well-formed account id that is not the token's account (a zone id pasted
+/// into the Account ID field, a typo) used to turn every zone call into
+/// `422 account with given Tag doesn't exist`. The token is fine; the listing
+/// still works, the test says which id is wrong, and a write names it in words.
+#[tokio::test]
+#[serial]
+async fn a_wrong_account_id_does_not_hide_the_zones_and_is_explained() {
+    let mut env = Env::new();
+    let stub = Stub::start().await;
+    stub.wire(&mut env);
+    env.set("CLOUDFLARE_API_TOKEN", CF_TOKEN);
+    env.set("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef");
+    request::<App, _, _>(|request, _ctx| async move {
+        let c = Call { request: &request };
+        let (s, zones) = c.get("/api/v1/dns/zones").await;
+        assert_eq!((s, zones), (200, json!([])));
+
+        let (s, t) = c.post("/api/v1/providers/cloudflare/test", json!({})).await;
+        assert_eq!(s, 200, "{t}");
+        assert_eq!(t["ok"], false, "{t}");
+        assert_eq!(t["state"], "unauthorized");
+        assert!(
+            t["detail"].as_str().unwrap().contains("cannot see account"),
+            "{t}"
+        );
+
+        let (s, b) = c
+            .post(
+                "/api/v1/dns/zones",
+                json!({"provider": "cloudflare", "name": "example.org"}),
+            )
+            .await;
+        assert_eq!(s, 422, "{b}");
+        let text = b.to_string();
+        assert!(text.contains("does not know the account id"), "{text}");
+        assert!(text.contains("Clear the Account ID"), "{text}");
+    })
+    .await;
+}
+
+/// An account-owned token (or one without Account Settings: Read) is a working
+/// token. `/user/tokens/verify` rejecting it and `/accounts` refusing it must
+/// not make the test say "unauthorized".
+#[tokio::test]
+#[serial]
+async fn an_account_owned_token_is_recognised() {
+    let mut env = Env::new();
+    let stub = Stub::start().await;
+    stub.wire(&mut env);
+    env.set("CLOUDFLARE_API_TOKEN", CF_ACCT_TOKEN);
+    request::<App, _, _>(|request, _ctx| async move {
+        let c = Call { request: &request };
+        let (s, t) = c.post("/api/v1/providers/cloudflare/test", json!({})).await;
+        assert_eq!(s, 200, "{t}");
+        assert_eq!(t["ok"], true, "{t}");
+        assert_eq!(t["state"], "ok");
+        let detail = t["detail"].as_str().unwrap();
+        assert!(detail.contains("the token works"), "{t}");
+        assert!(detail.contains("cannot list accounts"), "{t}");
+        // And it reads zones.
+        let (s, zones) = c.get("/api/v1/dns/zones").await;
+        assert_eq!((s, zones), (200, json!([])));
+    })
+    .await;
+}
+
+/// The account id is changed on its own: no token in the body keeps the stored
+/// one, blank clears the id, and without a stored token it is refused.
+#[tokio::test]
+#[serial]
+async fn the_account_id_is_changed_without_the_token() {
+    let mut env = Env::new();
+    let stub = Stub::start().await;
+    stub.wire(&mut env);
+    request::<App, _, _>(|request, ctx| async move {
+        let c = Call { request: &request };
+        let put = |body: Value| {
+            c.send(
+                "PUT",
+                "/api/v1/providers/cloudflare/credentials",
+                Some(body),
+                &[],
+            )
+        };
+        // Nothing stored yet: the account id alone is not enough.
+        let (s, b) = put(json!({"accountId": "acc1"})).await;
+        assert_eq!((s, b["error"].as_str()), (400, Some("invalid")), "{b}");
+
+        let (s, _) =
+            put(json!({"token": CF_TOKEN, "accountId": "0123456789abcdef0123456789abcdef"})).await;
+        assert_eq!(s, 204);
+        let (_, t) = c.post("/api/v1/providers/cloudflare/test", json!({})).await;
+        assert_eq!(t["ok"], false, "{t}");
+
+        // Fix the id without the token.
+        let (s, _) = put(json!({"accountId": "acc1"})).await;
+        assert_eq!(s, 204);
+        let row = provider_credentials::Model::find_by_provider(&ctx.db, "cloudflare")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.sealed_token.is_some(), "the token was dropped");
+        assert_eq!(row.account_id.as_deref(), Some("acc1"));
+        let (_, t) = c.post("/api/v1/providers/cloudflare/test", json!({})).await;
+        assert_eq!(
+            (t["ok"].as_bool(), t["accountId"].as_str()),
+            (Some(true), Some("acc1")),
+            "{t}"
+        );
+
+        // Blank clears it; Nexus then finds the account from the token.
+        let (s, _) = put(json!({"accountId": ""})).await;
+        assert_eq!(s, 204);
+        let row = provider_credentials::Model::find_by_provider(&ctx.db, "cloudflare")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.account_id, None);
+        let (_, t) = c.post("/api/v1/providers/cloudflare/test", json!({})).await;
+        assert_eq!(
+            (t["ok"].as_bool(), t["accountId"].as_str()),
+            (Some(true), Some("acc1")),
+            "{t}"
+        );
+
+        let (_, ops) = c.get("/api/v1/operations?provider=cloudflare").await;
+        assert!(
+            ops.as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["operation"] == "credentials.account"),
+            "{ops}"
+        );
     })
     .await;
 }

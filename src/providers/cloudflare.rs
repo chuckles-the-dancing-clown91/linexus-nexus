@@ -17,6 +17,10 @@ const MAX_PAGES: u64 = 200;
 /// Cloudflare error codes that mean "already exists".
 const CONFLICT_CODES: [i64; 4] = [1061, 81053, 81057, 81058];
 
+/// "account with given Tag doesn't exist": a well-formed account id that is not
+/// one of the token's accounts (a zone id, another account's id, a typo).
+const UNKNOWN_ACCOUNT_CODE: i64 = 70503;
+
 /// A Cloudflare client bound to one token (and possibly an account).
 #[derive(Clone)]
 pub struct Cloudflare {
@@ -83,6 +87,20 @@ impl Cloudflare {
                     .any(|c| message.contains(&format!("(code {c})")))
                 {
                     return Err(ProviderError::Conflict(message));
+                }
+                if message.contains(&format!("(code {UNKNOWN_ACCOUNT_CODE})")) {
+                    // The token was accepted; the account id it was sent with
+                    // is not one of its accounts. Say so in words the person
+                    // who typed it can act on.
+                    return Err(ProviderError::Rejected {
+                        status,
+                        message: format!(
+                            "Cloudflare accepted the token but does not know the account id Nexus is set to use \
+                             (it is not an account this token can see). Clear the Account ID under Write access so \
+                             Nexus finds the account from the token, or paste the right one (Cloudflare dashboard → \
+                             Account home → ⋮ → Copy account ID). [{message}]"
+                        ),
+                    });
                 }
                 return Err(ProviderError::Rejected { status, message });
             }
@@ -197,8 +215,56 @@ impl Cloudflare {
 
     pub async fn zones(&self) -> ProviderResult<Vec<Value>> {
         let account = self.account_id().await.ok();
-        let q: Vec<(&str, String)> = account.map(|a| vec![("account.id", a)]).unwrap_or_default();
-        self.list("/zones", &q, 50).await
+        let q: Vec<(&str, String)> = account
+            .clone()
+            .map(|a| vec![("account.id", a)])
+            .unwrap_or_default();
+        match self.list("/zones", &q, 50).await {
+            // The filter only narrows what the token sees; a wrong one must not
+            // hide the zones the token can read. The test endpoint reports the
+            // wrong id, and anything that writes still names it.
+            Err(ProviderError::Rejected { message, .. })
+                if account.is_some() && message.contains("Cloudflare accepted the token") =>
+            {
+                self.list("/zones", &[], 50).await
+            }
+            other => other,
+        }
+    }
+
+    /// A read that needs nothing but a working token: one zone, if any.
+    /// Account-owned tokens cannot use `/user/tokens/verify` and a token
+    /// without "Account Settings: Read" cannot list `/accounts`; both can
+    /// still do this, so it answers "does this token work at all".
+    pub async fn probe(&self) -> ProviderResult<Vec<Value>> {
+        let env = self
+            .call(
+                Method::GET,
+                "/zones",
+                &[("per_page", "5".to_string())],
+                None,
+            )
+            .await?;
+        Ok(env
+            .get("result")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// `/accounts/{id}/tokens/verify`: where an account-owned token is verified.
+    pub async fn verify_account_token(&self, account: &str) -> ProviderResult<Value> {
+        if !valid_id(account) {
+            return Err(ProviderError::NotFound(format!(
+                "no such account: {account}"
+            )));
+        }
+        self.result(
+            Method::GET,
+            &format!("/accounts/{account}/tokens/verify"),
+            None,
+        )
+        .await
     }
 
     pub async fn zone(&self, id: &str) -> ProviderResult<Value> {

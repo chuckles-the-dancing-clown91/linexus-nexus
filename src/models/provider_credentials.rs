@@ -55,6 +55,23 @@ impl Model {
         Ok(active.update(db).await?)
     }
 
+    /// Change only the account id (None clears it). The token stays; the
+    /// state learnt with the old account id is forgotten, since it was about
+    /// that account.
+    pub async fn set_account(
+        db: &DatabaseConnection,
+        provider: &str,
+        account_id: Option<String>,
+    ) -> ModelResult<Self> {
+        let mut active: ActiveModel = Self::row(db, provider).await?.into();
+        active.account_id = ActiveValue::set(account_id);
+        active.account_name = ActiveValue::set(None);
+        active.state = ActiveValue::set(Some("unknown".to_string()));
+        active.detail = ActiveValue::set(None);
+        active.checked_at = ActiveValue::set(None);
+        Ok(active.update(db).await?)
+    }
+
     /// Forget the stored token and the state learnt with it.
     pub async fn clear(db: &DatabaseConnection, provider: &str) -> ModelResult<()> {
         if let Some(row) = Self::find_by_provider(db, provider).await? {
