@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use linexus_nexus::{
     app::App,
+    dispatch,
     middleware::client_cert,
     models::{enrollment_tokens, provider_credentials, system_tokens, tasks},
     providers, secrets,
@@ -635,4 +636,135 @@ async fn production_config_comes_from_the_environment() {
     assert_eq!(c["server"]["middlewares"]["cors"]["enable"], false);
     env.unset("NEXUS_CORS_ORIGINS");
     env.unset("NEXUS_JWT_SECRET");
+}
+
+#[tokio::test]
+#[serial]
+async fn rejected_intents_fail_at_once_and_are_counted() {
+    let mut env = Env::new();
+    let stub = Stub::start().await;
+    stub.wire(&mut env);
+    request::<App, _, _>(|request, ctx| async move {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let task = |intent: &str| json!({"intent": intent, "targets": [agent_id]});
+
+        // The Orchestrator answers 400: the task fails now, with its reason,
+        // instead of sitting `accepted` for a day.
+        let (s, t) = send(
+            &request,
+            "POST",
+            "/api/v1/tasks",
+            Some(&root()),
+            Some(task("unplannable_thing")),
+            &[],
+        )
+        .await;
+        assert_eq!(s, 200, "{t}");
+        assert_eq!(t["status"], "failed");
+        let task_id = t["taskId"].as_str().unwrap().to_string();
+        let (_, t) = send(
+            &request,
+            "GET",
+            &format!("/api/v1/tasks/{task_id}"),
+            Some(&root()),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(t["status"], "failed");
+        assert_eq!(t["result"]["status"], "failed");
+        assert_eq!(t["result"]["error"], "unknown intent \"unplannable_thing\"");
+        assert_eq!(t["result"]["exitCode"], 1);
+        assert_eq!(t["result"]["steps"], json!([]));
+        assert!(t["completedAt"].as_str().is_some_and(|c| !c.is_empty()));
+
+        // Recorded while the Orchestrator was down, then rejected on re-plan:
+        // the sweep fails it and does not take the rejection for an outage.
+        env.set("LINEXUS_ORCH_URL", "http://127.0.0.1:9");
+        let (_, t) = send(
+            &request,
+            "POST",
+            "/api/v1/tasks",
+            Some(&root()),
+            Some(task("unplannable_later")),
+            &[],
+        )
+        .await;
+        assert_eq!(t["status"], "accepted");
+        let later_id = t["taskId"].as_str().unwrap().to_string();
+        let (_, t) = send(
+            &request,
+            "POST",
+            "/api/v1/tasks",
+            Some(&root()),
+            Some(task("run_command")),
+            &[],
+        )
+        .await;
+        assert_eq!(t["status"], "accepted");
+        stub.wire(&mut env);
+        let report = dispatch::sweep_accepted(&ctx).await.unwrap();
+        assert_eq!(
+            (report.rejected, report.planned, report.still_accepted),
+            (1, 1, 0),
+            "{report:?}"
+        );
+        let (_, t) = send(
+            &request,
+            "GET",
+            &format!("/api/v1/tasks/{later_id}"),
+            Some(&root()),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(t["status"], "failed");
+        assert_eq!(t["result"]["error"], "unknown intent \"unplannable_later\"");
+
+        // /metrics is public Prometheus text and saw both rejections.
+        let resp = request.get("/metrics").await;
+        assert_eq!(resp.status_code(), 200);
+        assert!(resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"));
+        let text = resp.text();
+        assert!(
+            text.contains("# TYPE nexus_tasks_plan_rejected_total counter\n"),
+            "{text}"
+        );
+        let rejected: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("nexus_tasks_plan_rejected_total "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(rejected >= 2, "{text}");
+        assert!(text.contains("nexus_http_requests_total "));
+
+        // The JWT-only operator routes (including the credential-less
+        // heartbeat) are gone: they answer exactly as an unknown path does
+        // (Loco's fallback page, which is HTML, not JSON — hence `Null`).
+        let (unknown_status, unknown_body) = send(
+            &request,
+            "GET",
+            "/api/definitely-not-a-route",
+            Some(&root()),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(unknown_body, Value::Null);
+        for (method, path) in [
+            ("GET", "/api/tasks".to_string()),
+            ("POST", "/api/tasks".to_string()),
+            ("GET", "/api/agents".to_string()),
+            ("POST", format!("/api/agents/{agent_id}/heartbeat")),
+        ] {
+            let (s, body) =
+                send(&request, method, &path, Some(&root()), Some(json!({})), &[]).await;
+            assert_eq!((s, body), (unknown_status, Value::Null), "{method} {path}");
+        }
+    })
+    .await;
 }

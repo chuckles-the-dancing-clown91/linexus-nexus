@@ -7,7 +7,10 @@
 //! reached the task is kept as `accepted` with its plan request, and
 //! [`replan_for_agent`] (on an agent's poll) or [`sweep_accepted`] (every
 //! 60 s in the server) plans it later — for up to [`REPLAN_WINDOW_HOURS`],
-//! after which it is `failed` with `result.error = "never planned"`.
+//! after which it is `failed` with `result.error = "never planned"`. When the
+//! Orchestrator *rejects* the intent ([`gateway_client::PlanRejected`]: an
+//! intent it has no plan for) the task is `failed` at once with its reason —
+//! retrying would not help, and the Hub should see why.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +18,8 @@ use loco_rs::app::AppContext;
 use loco_rs::model::{ModelError, ModelResult};
 use serde_json::{json, Value};
 
-use crate::gateway_client;
+use crate::gateway_client::{self, PlanRejected};
+use crate::metrics;
 use crate::models::{agents, tasks};
 
 /// How long an `accepted` task keeps being re-planned.
@@ -70,6 +74,7 @@ pub async fn dispatch(ctx: &AppContext, req: &DispatchRequest) -> ModelResult<ta
         target_agents: Some(targets.clone()),
     };
     let task = tasks::Model::create(&ctx.db, &req.requester, &params).await?;
+    metrics::task_created();
 
     // `set_environment` is the one intent that also changes what this service
     // knows, not just what an agent is asked to do. Applying it here means the
@@ -91,23 +96,39 @@ pub async fn dispatch(ctx: &AppContext, req: &DispatchRequest) -> ModelResult<ta
         .await?;
 
     let planned = plan(&task, &plan_body).await;
-    let (to, plan_str) = match &planned {
-        Ok(p) => ("planned", Some(p.as_str())),
-        Err(e) => {
-            tracing::warn!(error = %e, task_id = %task.task_id, "orchestrator planning failed; task recorded unplanned (accepted)");
-            ("accepted", None)
+    let mut rejected: Option<String> = None;
+    match &planned {
+        Ok(p) => {
+            tasks::Model::transition(&ctx.db, &task.task_id, &["pending"], "planned", Some(p))
+                .await?;
+            metrics::task_planned();
         }
-    };
-    tasks::Model::transition(&ctx.db, &task.task_id, &["pending"], to, plan_str).await?;
+        Err(e) => match e.downcast_ref::<PlanRejected>() {
+            Some(r) => {
+                tracing::warn!(error = %r, task_id = %task.task_id, intent = %req.intent, "orchestrator rejected the intent; task failed");
+                fail_rejected(ctx, &task.task_id, &["pending"], r).await?;
+                rejected = Some(r.0.clone());
+            }
+            None => {
+                tracing::warn!(error = %e, task_id = %task.task_id, "orchestrator planning failed; task recorded unplanned (accepted)");
+                tasks::Model::transition(&ctx.db, &task.task_id, &["pending"], "accepted", None)
+                    .await?;
+            }
+        },
+    }
     let task = tasks::Model::find_by_task_id(&ctx.db, &task.task_id).await?;
 
     // Best-effort: surface the task in the operational log so it appears when
     // the Hub tails the journal. A logging failure never fails the request.
+    let (level, message) = match &rejected {
+        Some(reason) => ("error", format!("task rejected: {}: {reason}", req.intent)),
+        None => ("info", format!("task planned: {}", req.intent)),
+    };
     let audit = json!({
         "task_id": task.task_id.to_string(),
-        "level": "info",
+        "level": level,
         "source": "nexus",
-        "message": format!("task planned: {}", req.intent),
+        "message": message,
         "metadata": {
             "intent": req.intent,
             "targets": targets,
@@ -154,11 +175,31 @@ fn plan_request_of(task: &tasks::Model) -> Value {
         })
 }
 
+/// Fail a task the Orchestrator rejected, with its reason as `result.error`.
+async fn fail_rejected(
+    ctx: &AppContext,
+    task_id: &uuid::Uuid,
+    from: &[&str],
+    rejected: &PlanRejected,
+) -> ModelResult<bool> {
+    metrics::task_plan_rejected();
+    tasks::Model::fail_unplanned(
+        &ctx.db,
+        task_id,
+        from,
+        &rejected.0,
+        "the Orchestrator rejected this intent; it was never handed to an agent",
+    )
+    .await
+}
+
 /// Outcome of trying to plan one `accepted` task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replan {
     Planned,
     Expired,
+    /// The Orchestrator rejected the intent; the task is `failed`.
+    Rejected,
     StillAccepted,
 }
 
@@ -180,16 +221,26 @@ pub async fn replan(ctx: &AppContext, task: &tasks::Model) -> ModelResult<Replan
                 Some(&p),
             )
             .await?;
+            if moved {
+                metrics::task_planned();
+            }
             Ok(if moved {
                 Replan::Planned
             } else {
                 Replan::StillAccepted
             })
         }
-        Err(e) => {
-            tracing::debug!(error = %e, task_id = %task.task_id, "re-plan failed");
-            Ok(Replan::StillAccepted)
-        }
+        Err(e) => match e.downcast_ref::<PlanRejected>() {
+            Some(r) => {
+                tracing::warn!(error = %r, task_id = %task.task_id, "orchestrator rejected the intent on re-plan; task failed");
+                fail_rejected(ctx, &task.task_id, &["accepted"], r).await?;
+                Ok(Replan::Rejected)
+            }
+            None => {
+                tracing::debug!(error = %e, task_id = %task.task_id, "re-plan failed");
+                Ok(Replan::StillAccepted)
+            }
+        },
     }
 }
 
@@ -211,6 +262,7 @@ pub async fn replan_for_agent(ctx: &AppContext, agent_id: &str) -> ModelResult<(
 pub struct SweepReport {
     pub planned: usize,
     pub expired: usize,
+    pub rejected: usize,
     pub still_accepted: usize,
 }
 
@@ -231,6 +283,7 @@ pub async fn sweep_accepted(ctx: &AppContext) -> ModelResult<SweepReport> {
         match replan(ctx, &task).await? {
             Replan::Planned => report.planned += 1,
             Replan::Expired => report.expired += 1,
+            Replan::Rejected => report.rejected += 1,
             Replan::StillAccepted => {
                 report.still_accepted += 1;
                 orchestrator_down = true;

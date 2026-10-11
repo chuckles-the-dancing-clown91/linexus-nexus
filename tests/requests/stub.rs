@@ -1,6 +1,8 @@
 //! In-process stand-ins for the services Nexus calls: the Orchestrator
-//! (`/orch/plan`, echoing a plan whose single step carries the params),
-//! Cloudflare (`/cf/...`, the v4 envelope) and DigitalOcean (`/v2/...`).
+//! (`/orch/plan`, echoing a plan whose single step carries the params, and
+//! rejecting any `unplannable_*` intent with `400` as the real one does for an
+//! unknown intent), Cloudflare (`/cf/...`, the v4 envelope) and DigitalOcean
+//! (`/v2/...`).
 //! Every request is recorded so tests can assert on what Nexus sent.
 //!
 //! Environment variables are process-global; every test that uses this is
@@ -224,6 +226,18 @@ async fn handle(
 
     match (m, segs.as_slice()) {
         // ---------------------------------------------------------- Orchestrator
+        ("POST", ["orch", "plan"])
+            if body["intent"]
+                .as_str()
+                .is_some_and(|i| i.starts_with("unplannable")) =>
+        {
+            let intent = body["intent"].as_str().unwrap_or_default();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown intent {intent:?}"), "intent": intent})),
+            )
+                .into_response()
+        }
         ("POST", ["orch", "plan"]) => {
             let task_id = body["task_id"].clone();
             Json(json!({

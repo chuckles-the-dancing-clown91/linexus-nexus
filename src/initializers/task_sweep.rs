@@ -35,9 +35,10 @@ impl Initializer for TaskSweep {
             loop {
                 tick.tick().await;
                 match dispatch::sweep_accepted(&ctx).await {
-                    Ok(r) if r.planned + r.expired > 0 => tracing::info!(
+                    Ok(r) if r.planned + r.expired + r.rejected > 0 => tracing::info!(
                         planned = r.planned,
                         expired = r.expired,
+                        rejected = r.rejected,
                         still_accepted = r.still_accepted,
                         "accepted-task sweep"
                     ),

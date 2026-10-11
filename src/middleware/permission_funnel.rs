@@ -14,6 +14,15 @@
 //! ```
 //!
 //! Each tier can DENY the request. If all tiers pass, the request proceeds.
+//!
+//! ## Step-up is not yet available
+//!
+//! Nothing in Nexus (or the Hub) mints a step-up token, so there is nothing a
+//! presented token can be verified against. Until a verifier exists, tier 4
+//! **refuses every destructive operation**, token or not — see
+//! [`step_up_refusal`]. Earlier versions accepted any non-empty string, which
+//! made the tier decorative. Wiring a real verifier means replacing that
+//! function's body, nothing else.
 
 use crate::middleware::rbac;
 use loco_rs::prelude::*;
@@ -70,6 +79,22 @@ impl OperationIntent {
     }
 }
 
+/// Tier 4 without I/O: why a destructive operation is refused, or `None`
+/// when the operation is not destructive. No step-up verifier exists yet, so
+/// a presented token is refused as unverifiable rather than taken on faith.
+#[must_use]
+pub fn step_up_refusal(is_destructive: bool, step_up_token: Option<&str>) -> Option<&'static str> {
+    if !is_destructive {
+        return None;
+    }
+    match step_up_token.map(str::trim) {
+        Some(t) if !t.is_empty() => Some(
+            "step-up token cannot be verified: no step-up verifier is configured, so destructive operations are refused",
+        ),
+        _ => Some("Step-up authentication required for destructive operations"),
+    }
+}
+
 /// Evaluate the full permission funnel for an operation.
 ///
 /// Returns a `FunnelResult` indicating whether the operation is allowed
@@ -102,14 +127,13 @@ pub async fn evaluate(
     // For now, if the RBAC check passes, resource-level access is granted.
 
     // === Tier 4: Step-Up Authentication ===
-    // Destructive operations require a step-up token.
-    // TODO: Verify the step-up token against the auth system.
-    // For now, any non-empty token is accepted.
-    if intent.is_destructive && step_up_token.is_none() {
+    // Destructive operations require a verified step-up token, and no
+    // verifier exists yet (module docs), so they are refused outright.
+    if let Some(reason) = step_up_refusal(intent.is_destructive, step_up_token) {
         return Ok(FunnelResult {
             allowed: false,
             denied_at_tier: Some(4),
-            reason: Some("Step-up authentication required for destructive operations".to_string()),
+            reason: Some(reason.to_string()),
         });
     }
 
@@ -118,4 +142,21 @@ pub async fn evaluate(
         denied_at_tier: None,
         reason: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destructive_operations_are_refused_until_a_verifier_exists() {
+        assert_eq!(step_up_refusal(false, None), None);
+        assert_eq!(step_up_refusal(false, Some("anything")), None);
+        assert!(step_up_refusal(true, None).is_some());
+        assert!(step_up_refusal(true, Some("   ")).is_some());
+        // The regression: a non-empty token used to pass.
+        assert!(step_up_refusal(true, Some("totally-legit")).is_some());
+        assert!(OperationIntent::new("tasks:delete").is_destructive);
+        assert!(!OperationIntent::new("tasks:create").is_destructive);
+    }
 }

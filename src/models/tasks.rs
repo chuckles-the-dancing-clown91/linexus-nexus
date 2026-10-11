@@ -263,6 +263,26 @@ impl Model {
     /// Give up on an `accepted` task: `failed` with `result.error = "never
     /// planned"`. Conditional, so a task planned meanwhile is left alone.
     pub async fn fail_never_planned(db: &DatabaseConnection, task_id: &Uuid) -> ModelResult<bool> {
+        Self::fail_unplanned(
+            db,
+            task_id,
+            &["accepted"],
+            "never planned",
+            "the Orchestrator could not be reached to plan this task",
+        )
+        .await
+    }
+
+    /// Fail a task that will never get a plan, with `error` as
+    /// `result.error` (the short reason) and `message` the explanation, exit
+    /// code 1 and no steps — provided it is still in one of `from`.
+    pub async fn fail_unplanned(
+        db: &DatabaseConnection,
+        task_id: &Uuid,
+        from: &[&str],
+        error: &str,
+        message: &str,
+    ) -> ModelResult<bool> {
         use sea_orm::sea_query::Expr;
         let now: DateTimeWithTimeZone = chrono::Local::now().into();
         let res = tasks::Entity::update_many()
@@ -270,14 +290,11 @@ impl Model {
             .col_expr(tasks::Column::UpdatedAt, Expr::value(now))
             .col_expr(tasks::Column::CompletedAt, Expr::value(now))
             .col_expr(tasks::Column::ResultStatus, Expr::value("failed"))
-            .col_expr(tasks::Column::ErrorMessage, Expr::value("never planned"))
-            .col_expr(
-                tasks::Column::ResultMessage,
-                Expr::value("the Orchestrator could not be reached to plan this task"),
-            )
+            .col_expr(tasks::Column::ErrorMessage, Expr::value(error))
+            .col_expr(tasks::Column::ResultMessage, Expr::value(message))
             .col_expr(tasks::Column::ExitCode, Expr::value(1_i64))
             .filter(tasks::Column::TaskId.eq(*task_id))
-            .filter(tasks::Column::Status.eq("accepted"))
+            .filter(tasks::Column::Status.is_in(from.iter().copied()))
             .exec(db)
             .await?;
         Ok(res.rows_affected > 0)

@@ -821,6 +821,7 @@ pub async fn report_result(
         steps,
     };
     let updated = task.record_result(&ctx.db, &params).await?;
+    crate::metrics::task_finished(final_status == "completed");
 
     let audit = json!({
         "agent_id": id,

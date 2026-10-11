@@ -66,8 +66,8 @@ hostgroup when the task is created.
 
 | Status | Meaning |
 |---|---|
-| `pending` | only for an instant while `POST /tasks` creates the row (and on tasks made through the operator API `/api/tasks`) |
-| `accepted` | recorded, but the Orchestrator could not plan it; re-planned when a target agent polls and by a 60 s sweep, for up to 24 h (then `failed`, `result.error = "never planned"`) |
+| `pending` | only for an instant while `POST /tasks` creates the row |
+| `accepted` | recorded, but the Orchestrator could not be reached to plan it; re-planned when a target agent polls and by a 60 s sweep, for up to 24 h (then `failed`, `result.error = "never planned"`). An intent the Orchestrator *rejects* (`400`, e.g. `unknown intent "…"`) is not retried: the task is `failed` at once with that reason as `result.error` |
 | `planned` | the Orchestrator returned a plan; waiting for the agent to poll |
 | `dispatched` | an agent has been handed the plan |
 | `completed` | the agent reported `success` |

@@ -394,10 +394,21 @@ the rule on and no client CA.
 
 **Production.** `LOCO_ENV=production` refuses to start unless
 `NEXUS_SYSTEM_TOKEN`, `NEXUS_SECRET_KEY` and `NEXUS_JWT_SECRET` are each at
-least 32 characters and not a development value; it warns when
-`NEXUS_PUBLIC_URL` is not `https://`. The development root token, the
-development sealing key and the seeded admin exist only in development / test.
-Everywhere, an empty environment variable counts as unset.
+least 32 characters and not a development value; unless
+`LINEXUS_SERVICE_TOKEN` is set whenever `LINEXUS_ORCH_URL` or
+`LINEXUS_LOGGER_URL` is; and unless `DAEDALUS_INGEST_KEY` is set whenever
+`DAEDALUS_INGEST_URL` is. It warns when `NEXUS_PUBLIC_URL` is not `https://`
+and when `NEXUS_REQUIRE_OPERATOR_CERT` is off (operator keys accepted without
+a client certificate); `NEXUS_REFUSE_WITHOUT_MTLS=1` turns that warning into a
+refusal. The development root token, the development sealing key and the
+seeded admin exist only in development / test. Everywhere, an empty
+environment variable counts as unset.
+
+**Metrics.** `GET /metrics` (public, outside `/api/v1`) serves Prometheus
+counters: `nexus_http_requests_total`, `nexus_tasks_created_total`,
+`nexus_tasks_planned_total`, `nexus_tasks_plan_rejected_total`,
+`nexus_tasks_completed_total`, `nexus_tasks_failed_total`,
+`nexus_logs_shipped_total`.
 
 ## 12. Signed plans
 

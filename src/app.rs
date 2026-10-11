@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::Router as AxumRouter;
 use loco_rs::{
     app::{AppContext, Hooks, Initializer},
-    bgworker::{BackgroundWorker, Queue},
+    bgworker::Queue,
     boot::{create_app, shutdown_signal, BootResult, ServeParams, StartMode},
     config::Config,
     controller::AppRoutes,
@@ -25,7 +25,6 @@ use crate::{
         users::{Model as UserModel, RegisterParams},
     },
     tasks,
-    workers::downloader::DownloadWorker,
 };
 
 /// Default development admin credentials, seeded at boot in the development
@@ -160,11 +159,13 @@ impl Hooks for App {
     }
 
     /// Every request passes the operator client-certificate rule
-    /// ([`crate::middleware::client_cert`]).
+    /// ([`crate::middleware::client_cert`]) and is counted for `/metrics`.
     async fn after_routes(router: AxumRouter, _ctx: &AppContext) -> Result<AxumRouter> {
-        Ok(router.layer(axum::middleware::from_fn(
-            crate::middleware::client_cert::guard,
-        )))
+        Ok(router
+            .layer(axum::middleware::from_fn(
+                crate::middleware::client_cert::guard,
+            ))
+            .layer(axum::middleware::from_fn(crate::metrics::count_request)))
     }
 
     /// Plain HTTP as Loco serves it, or native HTTPS (optionally asking for
@@ -199,10 +200,12 @@ impl Hooks for App {
     }
 
     fn routes(_ctx: &AppContext) -> AppRoutes {
+        // The JWT-only `/api/tasks` and `/api/agents` operator routes were
+        // removed: nothing called them (the Hub and the agent use `/api/v1`)
+        // and the legacy heartbeat took no credential at all.
         AppRoutes::with_default_routes() // controller routes below
             .add_route(controllers::auth::routes())
-            .add_route(controllers::tasks::routes())
-            .add_route(controllers::agents::routes())
+            .add_route(controllers::metrics::routes())
             .add_route(controllers::roles::routes())
             .add_route(controllers::nexus::routes())
             .add_route(controllers::housing::routes())
@@ -214,8 +217,8 @@ impl Hooks for App {
             .add_route(controllers::cloud::routes())
             .add_route(controllers::install::routes())
     }
-    async fn connect_workers(ctx: &AppContext, queue: &Queue) -> Result<()> {
-        queue.register(DownloadWorker::build(ctx)).await?;
+    async fn connect_workers(_ctx: &AppContext, _queue: &Queue) -> Result<()> {
+        // No background workers: the task sweep is an initializer.
         Ok(())
     }
 

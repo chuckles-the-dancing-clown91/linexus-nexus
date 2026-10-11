@@ -10,12 +10,23 @@
 //! development material; a JWT secret (`NEXUS_JWT_SECRET` in
 //! `config/production.yaml`) shorter than 32 characters;
 //! `NEXUS_REQUIRE_OPERATOR_CERT` without `NEXUS_TLS_CLIENT_CA` (it would
-//! refuse every operator). Errors everywhere: half a TLS configuration, an
-//! unparseable `NEXUS_SIGNING_KEY`. Warnings: `NEXUS_PUBLIC_URL` unset or not
-//! `https://`.
+//! refuse every operator); `LINEXUS_SERVICE_TOKEN` unset while
+//! `LINEXUS_ORCH_URL` or `LINEXUS_LOGGER_URL` is configured (the planner and
+//! the audit trail would be called without a credential);
+//! `DAEDALUS_INGEST_KEY` unset while `DAEDALUS_INGEST_URL` is configured;
+//! operator client certificates not required when
+//! `NEXUS_REFUSE_WITHOUT_MTLS` is on. Errors everywhere: half a TLS
+//! configuration, an unparseable `NEXUS_SIGNING_KEY`. Warnings:
+//! `NEXUS_PUBLIC_URL` unset or not `https://`; in strict mode, operator
+//! client certificates not required (`NEXUS_REQUIRE_OPERATOR_CERT` off).
 
 use crate::middleware::{client_cert, system_token};
-use crate::{secrets, signing, tls};
+use crate::{gateway_client, secrets, signing, tls};
+
+/// Environment switch: `1` / `true` / `yes` makes a strict boot refuse to
+/// start unless operator client certificates are required, instead of
+/// warning.
+pub const ENV_REFUSE_WITHOUT_MTLS: &str = "NEXUS_REFUSE_WITHOUT_MTLS";
 
 /// Minimum length of the root token, the sealing key and the JWT secret.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -83,6 +94,44 @@ pub fn check(
             f.errors.push(format!(
                 "the JWT secret (NEXUS_JWT_SECRET) must be at least {MIN_SECRET_LEN} characters"
             ));
+        }
+
+        // Outbound credentials: a configured peer must be called with one.
+        let peers: Vec<&str> = [gateway_client::ENV_ORCH_URL, gateway_client::ENV_LOGGER_URL]
+            .into_iter()
+            .filter(|k| get(k).is_some())
+            .collect();
+        if !peers.is_empty() && get(gateway_client::ENV_SERVICE_TOKEN).is_none() {
+            f.errors.push(format!(
+                "{} is not set but {} is: the Orchestrator and Logger would be called without a credential",
+                gateway_client::ENV_SERVICE_TOKEN,
+                peers.join(" and ")
+            ));
+        }
+        if get(gateway_client::ENV_INGEST_URL).is_some()
+            && get(gateway_client::ENV_INGEST_KEY).is_none()
+        {
+            f.errors.push(format!(
+                "{} is not set but {} is: task results would be posted to the Hub unauthenticated",
+                gateway_client::ENV_INGEST_KEY,
+                gateway_client::ENV_INGEST_URL
+            ));
+        }
+
+        // Operator keys are bearer tokens; without the client-certificate
+        // rule a leaked key is enough to drive the fleet.
+        if !client_cert::required_value(var(client_cert::ENV_REQUIRE).as_deref()) {
+            let msg = format!(
+                "{} is off: operator keys are accepted without a client certificate (set it and {} to require mTLS)",
+                client_cert::ENV_REQUIRE,
+                tls::ENV_CLIENT_CA
+            );
+            if client_cert::required_value(var(ENV_REFUSE_WITHOUT_MTLS).as_deref()) {
+                f.errors
+                    .push(format!("{msg}; {ENV_REFUSE_WITHOUT_MTLS} is on"));
+            } else {
+                f.warnings.push(msg);
+            }
         }
     }
 
@@ -159,12 +208,66 @@ mod tests {
             ("NEXUS_SYSTEM_TOKEN", GOOD_TOKEN),
             ("NEXUS_SECRET_KEY", GOOD_KEY),
             ("NEXUS_PUBLIC_URL", "https://nexus.example.com"),
+            ("NEXUS_TLS_CERT", "/etc/nexus/cert.pem"),
+            ("NEXUS_TLS_KEY", "/etc/nexus/key.pem"),
+            ("NEXUS_TLS_CLIENT_CA", "/etc/nexus/clients.pem"),
+            ("NEXUS_REQUIRE_OPERATOR_CERT", "1"),
         ]
+    }
+
+    /// `good()` without the mTLS settings: a complete, warning-only setup.
+    fn good_without_mtls() -> Vec<(&'static str, &'static str)> {
+        good().into_iter().take(3).collect()
     }
 
     #[test]
     fn a_complete_production_environment_passes() {
         assert_eq!(run(true, &good(), Some(GOOD_JWT)), Findings::default());
+    }
+
+    #[test]
+    fn production_without_mtls_only_warns_unless_told_to_refuse() {
+        let f = run(true, &good_without_mtls(), Some(GOOD_JWT));
+        assert!(f.errors.is_empty(), "{f:?}");
+        assert_eq!(f.warnings.len(), 1, "{f:?}");
+        assert!(f.warnings[0].contains("NEXUS_REQUIRE_OPERATOR_CERT is off"));
+
+        let mut vars = good_without_mtls();
+        vars.push((ENV_REFUSE_WITHOUT_MTLS, "1"));
+        let f = run(true, &vars, Some(GOOD_JWT));
+        assert_eq!(f.errors.len(), 1, "{f:?}");
+        assert!(f.errors[0].contains("NEXUS_REFUSE_WITHOUT_MTLS is on"));
+        // Development never cares.
+        assert_eq!(
+            run(false, &[(ENV_REFUSE_WITHOUT_MTLS, "1")], None),
+            Findings::default()
+        );
+    }
+
+    #[test]
+    fn production_requires_credentials_for_configured_peers() {
+        for url in ["LINEXUS_ORCH_URL", "LINEXUS_LOGGER_URL"] {
+            let mut vars = good();
+            vars.push((url, "http://10.0.0.5:5152"));
+            let f = run(true, &vars, Some(GOOD_JWT));
+            assert_eq!(f.errors.len(), 1, "{url}: {f:?}");
+            assert!(f.errors[0].starts_with("LINEXUS_SERVICE_TOKEN is not set"));
+            assert!(f.errors[0].contains(url));
+            vars.push(("LINEXUS_SERVICE_TOKEN", "svc-token"));
+            assert_eq!(run(true, &vars, Some(GOOD_JWT)), Findings::default());
+        }
+        let mut vars = good();
+        vars.push(("DAEDALUS_INGEST_URL", "https://hub.example.com"));
+        let f = run(true, &vars, Some(GOOD_JWT));
+        assert_eq!(f.errors.len(), 1, "{f:?}");
+        assert!(f.errors[0].starts_with("DAEDALUS_INGEST_KEY is not set"));
+        vars.push(("DAEDALUS_INGEST_KEY", "ingest-key"));
+        assert_eq!(run(true, &vars, Some(GOOD_JWT)), Findings::default());
+        // Unconfigured peers need nothing; development needs nothing either.
+        let mut dev = vec![("LINEXUS_ORCH_URL", "http://127.0.0.1:5152")];
+        assert_eq!(run(false, &dev, None), Findings::default());
+        dev.push(("DAEDALUS_INGEST_URL", "http://127.0.0.1:8080"));
+        assert_eq!(run(false, &dev, None), Findings::default());
     }
 
     #[test]
@@ -209,7 +312,7 @@ mod tests {
         let f = run(false, &[("NEXUS_REQUIRE_OPERATOR_CERT", "1")], None);
         assert_eq!((f.errors.len(), f.warnings.len()), (0, 1));
         // …and refuses in production.
-        let mut vars = good();
+        let mut vars = good_without_mtls();
         vars.push(("NEXUS_REQUIRE_OPERATOR_CERT", "1"));
         assert_eq!(run(true, &vars, Some(GOOD_JWT)).errors.len(), 1);
     }
