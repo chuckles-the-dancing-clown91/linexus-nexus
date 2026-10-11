@@ -874,7 +874,12 @@ async fn install_script_and_binaries_are_public() {
             "/usr/local/bin/linexus-agent",
             "/etc/linexus/agent.env",
             "AGENT_STATE_FILE=$STATE_FILE",
-            "/var/lib/linexus/agent-state.json",
+            // The agent's own state directory, never the services' shared
+            // /var/lib/linexus — and an earlier install's identity moves over.
+            "STATE_DIR=/var/lib/linexus-agent",
+            "Environment=AGENT_STATE_FILE=/var/lib/linexus-agent/agent-state.json",
+            "StateDirectory=linexus-agent",
+            "OLD_STATE_FILE=/var/lib/linexus/agent-state.json",
             "/etc/systemd/system/linexus-agent.service",
             "Restart=always",
             "EnvironmentFile=/etc/linexus/agent.env",

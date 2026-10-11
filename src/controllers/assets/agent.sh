@@ -20,7 +20,7 @@
 #   1. download rmm-agent-linux-<amd64|arm64> from $AGENT_BINARY_URL
 #      (default $NEXUS_URL/install) to /usr/local/bin/linexus-agent;
 #   2. write /etc/linexus/agent.env (0600) with NEXUS_URL, ENROLLMENT_TOKEN,
-#      AGENT_STATE_FILE=/var/lib/linexus/agent-state.json,
+#      AGENT_STATE_FILE=/var/lib/linexus-agent/agent-state.json,
 #      LINEXUS_SIGNING_PUBKEY and (with a CA) LINEXUS_CA_FILE, keeping any
 #      other lines an operator added;
 #   3. install /etc/systemd/system/linexus-agent.service, enable and
@@ -36,7 +36,18 @@ die() { echo "linexus-agent install: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root (pipe to 'sudo sh')"
 [ -n "${NEXUS_URL:-}" ] || die "NEXUS_URL is required"
 NEXUS_URL=${NEXUS_URL%/}
-STATE_FILE=/var/lib/linexus/agent-state.json
+STATE_DIR=/var/lib/linexus-agent
+STATE_FILE=$STATE_DIR/agent-state.json
+# The agent used to keep its state in /var/lib/linexus, shared with the Linexus
+# services (user linexus). As root with StateDirectory=linexus it made systemd
+# reset that directory to root 0700 on every start, locking the logger and the
+# orchestrator out. It has its own directory now; an earlier install's
+# identity moves with it, so the agent resumes as itself.
+OLD_STATE_FILE=/var/lib/linexus/agent-state.json
+if [ ! -s "$STATE_FILE" ] && [ -s "$OLD_STATE_FILE" ]; then
+  install -d -m 0700 "$STATE_DIR"
+  cp -p "$OLD_STATE_FILE" "$STATE_FILE"
+fi
 if [ -z "${ENROLLMENT_TOKEN:-}" ] && [ ! -s "$STATE_FILE" ] && [ -z "${AGENT_TOKEN:-}" ]; then
   die "ENROLLMENT_TOKEN is required for a first install"
 fi
@@ -96,7 +107,7 @@ if ! cmp -s "$TMP" "$BIN" 2>/dev/null; then
 fi
 
 install -d -m 0755 /etc/linexus
-install -d -m 0700 /var/lib/linexus
+install -d -m 0700 "$STATE_DIR"
 
 # Keep the CA where the agent reads it (LINEXUS_CA_FILE).
 CA_FILE=
@@ -142,11 +153,11 @@ After=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/linexus/agent.env
-Environment=AGENT_STATE_FILE=/var/lib/linexus/agent-state.json
+Environment=AGENT_STATE_FILE=/var/lib/linexus-agent/agent-state.json
 ExecStart=/usr/local/bin/linexus-agent
-StateDirectory=linexus
+StateDirectory=linexus-agent
 StateDirectoryMode=0700
-WorkingDirectory=/var/lib/linexus
+WorkingDirectory=/var/lib/linexus-agent
 UMask=0022
 Restart=always
 RestartSec=10
